@@ -1,0 +1,1007 @@
+---
+title: "Case 2: Andersen et al. (2011)"
+subtitle: "Stakes in the ultimatum game"
+author: "Johannes Valentin Solibieda"
+date: "November 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Figures used in the thesis: the chunk option fig.process = thesis_fig("caseN-name")
+# (together with dpi = 300, fig.retina = 1) copies the chunk's figure to ../Thesis/figures.
+thesis_fig <- function(name) function(path) {
+  file.copy(path, file.path("../Thesis/figures", paste0(name, ".png")), overwrite = TRUE)
+  path
+}
+```
+
+**Study:** Andersen, S., Ertaç, S., Gneezy, U., Hoffman, M. and List, J. A. (2011). Stakes Matter in Ultimatum Games. *American Economic Review* 101(7): 3427–3439. <https://doi.org/10.1257/aer.101.7.3427>
+
+**Data:** `Andersen et al. 2011/` (original data `DATA.dta` and Stata do-file of the authors).
+
+This file reproduces all results, tables and figures of Case 2 (Section 4.2 of the thesis). It is self-contained: it reads the original data and defines every helper it uses. As in the thesis, the two research hypotheses are treated one after the other, each with its own diagnostics, test choice and results.
+
+## Original study and research hypotheses
+
+Andersen, Ertaç, Gneezy, Hoffman and List (2011) study whether stakes matter in the ultimatum game. A proposer suggests how to split a pie, and a responder either accepts (the split is implemented) or rejects (both get nothing). A purely money-maximising responder should accept every positive offer. In practice, low offers are often rejected, and earlier studies found that rejection behaviour barely changes with the stakes. The authors argue that this is because those studies observed almost no low offers at high stakes.
+
+To overcome this, they ran the game in Northeast India with pies of Rs 20, 200, 2,000 and 20,000. Since 100 rupees is roughly one day's wage there, the stakes range from about 1.6 hours to 1,600 hours of work. Proposers received an additional paragraph explaining that a money-maximising responder accepts any positive offer, which successfully elicited many low offers. A second factor, *wealth*, randomly assigned whether a subject had already earned money in unrelated tasks before the game.
+
+The paper has two main results:
+
+1. **Proposers:** the share of the pie offered falls with the stakes, while the absolute amount rises. The authors test this with pairwise two-sample $t$-tests and themselves call it "not our main focus".
+2. **Responders:** rejection rates fall with the stakes. This is the headline result. The authors support it with (a) Fisher's exact tests of rejection against stakes, separately for the wealth and no-wealth groups, (b) pairwise two-sample $z$-tests of proportions between stake levels, and (c) a logit regression `reject ~ wealth + stakes_2 + stakes_3 + stakes_4 + percent_offer` (Table 3).
+
+This case study covers both results:
+
+> **RH1:** The share of the pie offered decreases as the stakes increase.
+>
+> **RH2:** Rejection rates decrease as the stakes increase.
+
+| Variable | Meaning |
+|---|---|
+| `reject` | 1 if the responder rejected the offer (= 1 − `accept`) |
+| `stakes` | Size of the pie in rupees (20, 200, 2,000, 20,000) |
+| `stakes_2`–`stakes_4` | Dummies for Rs 200, 2,000 and 20,000 (Rs 20 is the baseline) |
+| `percent_offer` | Share of the pie offered to the responder |
+| `wealth` | 1 if the subject earned money in unrelated tasks before the game |
+| `IN` | 1 for the authors' own data (the file also contains Slonim & Roth and Cameron) |
+
+```{r c2-setup, message=FALSE, warning=FALSE}
+library(haven); library(dplyr); library(tidyr); library(ggplot2)
+library(patchwork)
+
+an <- read_dta("Andersen et al. 2011/DATA.dta") %>%
+  filter(IN == 1) %>%                      # own experiment only
+  mutate(reject = 1 - accept,
+         stakes_f = factor(stakes, levels = c(20, 200, 2000, 20000),
+                           labels = c("Rs 20", "Rs 200", "Rs 2,000", "Rs 20,000")),
+         wealth_f = factor(wealth, levels = c(0, 1), labels = c("No wealth", "Wealth")))
+
+stakes_order <- c(20, 200, 2000, 20000)
+nrow(an)
+```
+
+### Helper functions
+
+The ordered rank tests are used for both research hypotheses. All of them are written for the predicted *decreasing* alternative.
+
+```{r c2-helpers}
+# Pool-adjacent-violators on group means with weights
+pava <- function(y, w) {
+  blocks <- as.list(seq_along(y)); yy <- y; ww <- w
+  repeat {
+    viol <- which(diff(yy) < 0)
+    if (!length(viol)) break
+    j <- viol[1]
+    yy[j] <- (ww[j] * yy[j] + ww[j + 1] * yy[j + 1]) / (ww[j] + ww[j + 1])
+    ww[j] <- ww[j] + ww[j + 1]
+    blocks[[j]] <- c(blocks[[j]], blocks[[j + 1]])
+    yy <- yy[-(j + 1)]; ww <- ww[-(j + 1)]; blocks <- blocks[-(j + 1)]
+  }
+  fit <- numeric(length(y))
+  for (b in seq_along(blocks)) fit[blocks[[b]]] <- yy[b]
+  list(fit = fit, n_levels = length(yy))
+}
+
+# Chacko-Shorack statistic for a DECREASING alternative: groups are reversed
+# so that the hypothesised order becomes increasing. Tie-corrected.
+chacko_stat <- function(x, g) {
+  g  <- factor(g, levels = stakes_order)
+  N  <- length(x); r <- rank(x)
+  ni <- rev(as.numeric(tapply(r, g, length)))
+  Ri <- rev(as.numeric(tapply(r, g, mean)))
+  iso <- pava(Ri, ni)
+  tt  <- table(x); C <- 1 - sum(tt^3 - tt) / (N^3 - N)
+  list(K = 12 / (N * (N + 1)) * sum(ni * (iso$fit - (N + 1) / 2)^2) / C,
+       n_levels = iso$n_levels, weights = ni,
+       mean_ranks = setNames(rev(Ri), stakes_order),
+       isotonic   = setNames(rev(iso$fit), stakes_order))
+}
+
+# Chi-bar-squared p-value: level probabilities by simulation
+chibar_p <- function(K, w, B = 1e5, seed = 1) {
+  set.seed(seed)
+  k <- length(w)
+  lev <- tabulate(replicate(B, pava(rnorm(k, 0, sqrt(1 / w)), w)$n_levels), nbins = k) / B
+  sum(sapply(2:k, function(i) lev[i] * pchisq(K, df = i - 1, lower.tail = FALSE)))
+}
+
+# Jonckheere-Terpstra for a DECREASING alternative with tie-corrected variance
+# (Lehmann 2006). Groups are reversed so the alternative is increasing.
+jt_test <- function(x, g) {
+  g  <- factor(g, levels = rev(stakes_order)); lv <- levels(g)
+  W  <- 0
+  for (i in 1:(length(lv) - 1)) for (j in (i + 1):length(lv)) {
+    a <- x[g == lv[i]]; b <- x[g == lv[j]]
+    W <- W + sum(outer(a, b, "<")) + 0.5 * sum(outer(a, b, "=="))
+  }
+  n <- as.numeric(table(g)); N <- sum(n); t <- as.numeric(table(x))
+  E <- (N^2 - sum(n^2)) / 4
+  V <- (N * (N - 1) * (2 * N + 5) - sum(n * (n - 1) * (2 * n + 5)) -
+          sum(t * (t - 1) * (2 * t + 5))) / 72 +
+       sum(n * (n - 1) * (n - 2)) * sum(t * (t - 1) * (t - 2)) / (36 * N * (N - 1) * (N - 2)) +
+       sum(n * (n - 1)) * sum(t * (t - 1)) / (8 * N * (N - 1))
+  c(W = W, p = pnorm((W - E) / sqrt(V), lower.tail = FALSE))
+}
+
+# Both ordered rank tests on one data set
+rank_tests <- function(dd, B = 2e4, seed = 1) {
+  x <- dd$reject; g <- dd$stakes
+  jt_asy  <- jt_test(x, g)
+  set.seed(seed)
+  null_JT <- replicate(B, jt_test(x, sample(g))["W"])
+  cs <- chacko_stat(x, g)
+  set.seed(seed)
+  null_K <- replicate(B, chacko_stat(x, sample(g))$K)
+  data.frame(test = c("Jonckheere-Terpstra", "Chacko-Shorack"),
+             statistic = c(unname(jt_asy["W"]), cs$K),
+             p_asymptotic = c(unname(jt_asy["p"]), chibar_p(cs$K, cs$weights)),
+             p_permutation = c((1 + sum(null_JT >= jt_asy["W"])) / (B + 1),
+                               (1 + sum(null_K >= cs$K)) / (B + 1)))
+}
+
+# Brunner-Munzel statistic for the relative effect p = P(a < b) + 0.5 P(a = b)
+bm <- function(a, b) {
+  na <- length(a); nb <- length(b); N <- na + nb
+  r  <- rank(c(a, b)); ra <- r[seq_len(na)]; rb <- r[-seq_len(na)]
+  ma <- mean(ra); mb <- mean(rb)
+  sa <- sum((ra - rank(a) - ma + (na + 1) / 2)^2) / (na - 1)
+  sb <- sum((rb - rank(b) - mb + (nb + 1) / 2)^2) / (nb - 1)
+  V  <- na * sa + nb * sb
+  list(W    = if (V == 0) sign(mb - ma) * Inf else na * nb * (mb - ma) / (N * sqrt(V)),
+       df   = if (V == 0) NA_real_ else V^2 / ((na * sa)^2 / (na - 1) + (nb * sb)^2 / (nb - 1)),
+       phat = (mb - (nb + 1) / 2) / na)
+}
+# Two-sided studentised permutation p-value and t-approximation
+bm_test <- function(a, b, B = 1e4, seed = 1) {
+  s <- bm(a, b); v <- c(a, b); na <- length(a)
+  set.seed(seed)
+  W_perm <- replicate(B, { i <- sample.int(length(v), na); bm(v[i], v[-i])$W })
+  c(phat = s$phat,
+    p_bm_permutation = (1 + sum(abs(W_perm) >= abs(s$W) - 1e-10)) / (B + 1),
+    p_bm_t = if (is.finite(s$W)) 2 * pt(-abs(s$W), s$df) else NA)
+}
+```
+
+## RH1: Offers
+
+### Data diagnostics and fit of the original analysis: offers
+
+```{r c2-desc-offers}
+an %>%
+  group_by(stakes_f) %>%
+  summarise(n = n(), mean = mean(percent_offer), sd = sd(percent_offer),
+            median = median(percent_offer),
+            q25 = quantile(percent_offer, .25), q75 = quantile(percent_offer, .75),
+            distinct = n_distinct(percent_offer), .groups = "drop") %>%
+  knitr::kable(digits = 3)
+
+sort(table(round(an$percent_offer, 3)), decreasing = TRUE)[1:6]
+```
+
+```{r c2-fig-offers, fig.width=9, fig.height=5, dpi=300, fig.retina=1, fig.process=thesis_fig("case2-h1-offers")}
+p_hist_off <- ggplot(an, aes(percent_offer)) +
+  geom_histogram(binwidth = 0.025, boundary = 0, fill = "gray40") +
+  facet_wrap(~ stakes_f, ncol = 1, scales = "free_y") +
+  scale_y_continuous(n.breaks = 3) +
+  labs(x = "Share of pie offered", y = "Count") +
+  theme_minimal(base_size = 11)
+
+p_ecdf_off <- ggplot(an, aes(percent_offer, colour = stakes_f)) +
+  stat_ecdf(geom = "step", linewidth = 0.9) +
+  labs(x = "Share of pie offered", y = "Empirical CDF", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+
+p_hist_off + p_ecdf_off
+```
+
+Offer shares are bounded between 0 and 1, right-skewed and concentrated on a few focal points: 25% of the pie (160 offers), 10% (91) and 5% (67) account for 69% of all offers, and only 22 distinct values occur. The ECDFs are ordered as predicted: the higher the stakes, the further left the curve, so offers fall stochastically with the stakes. The curves for Rs 2,000 and Rs 20,000 lie close together and cross, and above 25% the Rs 20 curve stays lowest because generous offers of 50% or more are most frequent there.
+
+```{r c2-diag-offers}
+m_aov <- lm(percent_offer ~ factor(stakes), data = an)
+c(shapiro_residuals = shapiro.test(resid(m_aov))$p.value,
+  bartlett = bartlett.test(percent_offer ~ factor(stakes), data = an)$p.value,
+  fligner  = fligner.test(percent_offer ~ factor(stakes), data = an)$p.value)
+```
+
+```{r c2-qq-offers, fig.width=5, fig.height=4}
+qqnorm(resid(m_aov), main = "Residuals of offer share on stakes"); qqline(resid(m_aov), col = "red")
+```
+
+The authors' $t$-tests assume normally distributed offer shares within each group. This is clearly violated: the residuals are strongly non-normal (Shapiro–Wilk p < 0.001), with a step pattern in the Q-Q plot caused by the focal points and a long right tail of generous offers (up to 95%). The outcome is bounded, discrete and heavily tied. With 109–201 observations, the central limit theorem protects the $t$-test for most comparisons, but every comparison with Rs 20,000 rests on only 24 offers. The pooled-variance $t$-test also assumes equal variances. Bartlett's test rejects this (p = 0.013), but it is itself sensitive to non-normality; the robust Fligner–Killeen test does not (p = 0.63), so unequal variances are not the main issue.
+
+### Test choice and justification: offers
+
+RH1 compares four independent groups with a bounded, skewed and heavily tied outcome and a hypothesised ordering. Following the decision table of the thesis (Section 3.4), two rank-based alternatives fit:
+
+* **Pairwise Wilcoxon rank-sum tests** are the direct counterpart to the authors' pairwise $t$-tests, with the Hodges–Lehmann (HL) shift as effect size. They are insensitive to the long right tail of the offers. The substantive comparisons are the three adjacent tenfold increases; Rs 20 vs 20,000 is added because the authors report it.
+* The **Jonckheere–Terpstra test** tests RH1 as a whole, i.e. that offer shares decrease stochastically from Rs 20 to Rs 20,000, with a single test instead of several pairwise ones. Since the observed ordering of the offers is not violated, the Jonckheere test can use the full ordering information, and a Chacko–Shorack test is not needed.
+
+### Results: offers
+
+#### Replication of the original analysis
+
+The authors compare the offer shares of all pairs of stake levels with two-sample $t$-tests (Stata `ttest`, i.e. with pooled variance), and test for a wealth effect within each stake level.
+
+```{r c2-ttest}
+pairs_stakes <- combn(stakes_order, 2, simplify = FALSE)
+
+t_tab <- bind_rows(lapply(pairs_stakes, function(p) {
+  a <- an$percent_offer[an$stakes == p[1]]; b <- an$percent_offer[an$stakes == p[2]]
+  data.frame(pair = paste(p, collapse = " vs "),
+             mean_1 = mean(a), mean_2 = mean(b), diff = mean(a) - mean(b),
+             p_ttest = t.test(a, b, var.equal = TRUE)$p.value)
+}))
+knitr::kable(t_tab, digits = 4, row.names = FALSE)
+
+# wealth effect within each stake level
+sapply(stakes_order, function(s) {
+  d <- filter(an, stakes == s)
+  t.test(percent_offer ~ wealth, data = d, var.equal = TRUE)$p.value
+}) %>% setNames(stakes_order) %>% round(3)
+```
+
+The $t$-tests reproduce the paper for 20 vs 200 (p < 0.001) and 20 vs 20,000 (p = 0.0002). The paper also reports p = 0.000 for "Rs 200 versus Rs 2,000", but that comparison yields p = 0.063; the reported value matches 20 vs 2,000 and is most likely a typo. This matters because the authors conclude that offer shares decline significantly "with the first and second tenfold increase in stakes". With their own test, the second tenfold increase (200 → 2,000) is *not* significant at the 5% level. The third (2,000 → 20,000) is insignificant, as the paper states, and there is no wealth effect at any stake level.
+
+#### Rank-based tests
+
+```{r c2-offers-tests, cache=TRUE}
+w_tab <- bind_rows(lapply(pairs_stakes, function(p) {
+  a <- an$percent_offer[an$stakes == p[1]]; b <- an$percent_offer[an$stakes == p[2]]
+  w <- wilcox.test(a, b, conf.int = TRUE, exact = FALSE)
+  data.frame(pair = paste(p, collapse = " vs "),
+             diff_mean = mean(a) - mean(b), hl = unname(w$estimate),
+             p_ttest = t.test(a, b, var.equal = TRUE)$p.value, p_wilcoxon = w$p.value)
+}))
+knitr::kable(w_tab, digits = 4, row.names = FALSE)
+
+jt_off <- jt_test(an$percent_offer, an$stakes)   # alternative: offers decrease with stakes
+set.seed(1)
+null_off <- replicate(2e4, jt_test(an$percent_offer, sample(an$stakes))["W"])
+c(JT = unname(jt_off["W"]), p_asymptotic = unname(jt_off["p"]),
+  p_permutation = (1 + sum(null_off >= jt_off["W"])) / (2e4 + 1))
+```
+
+All six pairs are computed above; the thesis reports the three adjacent tenfold increases plus Rs 20 vs 20,000. The pairwise Wilcoxon tests agree with the $t$-tests on the clear cases (20 vs 200 and 20 vs 20,000 highly significant, 2,000 vs 20,000 not), but differ for the second tenfold increase: for 200 vs 2,000, the Wilcoxon test is significant (p = 0.010), whereas the $t$-test is not (p = 0.063). The rank-based analysis therefore *supports* the authors' statement that offers fall with the second tenfold increase in stakes, which their own $t$-test does not. The HL shifts are multiples of 5 percentage points, reflecting the focal points of the offers.
+
+The Jonckheere test confirms the ordered alternative for the whole design at once (p < 0.0001), with a single test instead of six.
+
+#### Brunner–Munzel check
+
+The Wilcoxon test is exact only when both groups have the same distribution. The Brunner–Munzel test drops this assumption (Brunner and Munzel 2000); its p-value is obtained from a studentised permutation test (Neubert and Brunner 2007). The thesis states in a footnote (Section 4.5) that the test was applied in all cases and did not change any conclusion; this section documents the check for the offers.
+
+```{r c2-bm-offers, cache=TRUE}
+bm_off <- bind_rows(lapply(list(c(20, 200), c(200, 2000), c(2000, 20000), c(20, 20000)), function(p) {
+  a <- an$percent_offer[an$stakes == p[2]]; b <- an$percent_offer[an$stakes == p[1]]   # higher vs lower stakes
+  data.frame(pair = paste(p, collapse = " vs "),
+             p_wilcoxon = suppressWarnings(wilcox.test(b, a, exact = FALSE)$p.value),
+             t(bm_test(a, b)))
+}))
+knitr::kable(bm_off, digits = 4, row.names = FALSE)
+```
+
+The Brunner–Munzel test leads to the same conclusion as the Wilcoxon test for every pair.
+
+#### Resampling simulations
+
+The simulation follows Section 3.5 of the thesis, extended from two to four groups. The tests compared are the authors' pairwise $t$-test and the Wilcoxon rank-sum test for one pair of stake levels, and the Jonckheere–Terpstra test for RH1 as a whole. The default pair is Rs 200 vs Rs 2,000, the comparison in which the $t$-test and the Wilcoxon test disagree.
+
+**Data-generating process.** As described for several ordered groups in Section 3.5, every stake group $g$ is shifted relative to the overall mean of all offers. With $\hat\theta_g$ the distance of the mean of group $g$ from the overall mean, the effect is removed and re-added with strength $s$:
+$$Y_g^{(s)} = \min\{\max\{Y_g - \hat\theta_g + s\,\hat\theta_g,\ 0\},\ 1\}.$$
+With $s = 0$ all groups share the same location, $s = 1$ reproduces the observed data, and $s > 1$ exaggerates the effect. Offers are shares of the pie, so shifted values are capped to $[0, 1]$. A centring on the Hodges–Lehmann shift, as in Case 1, is not possible here: because offers pile up on 5%, 10% and 25%, the HL shift between a stake group and the pooled offers is exactly 0 for both Rs 20 and Rs 200, so these groups would not be shifted at all.
+
+```{r c2-sim-params, cache=TRUE}
+# ---- Parameters (change here) ---------------------------------------------
+sim_pair  <- c(200, 2000)          # pair for the pairwise t-test / Wilcoxon test
+alpha     <- 0.05
+B_size    <- 5000                  # replications for size and power at s = 1
+B_curve   <- 2000                  # replications per point of the power curves
+s_grid    <- seq(0, 1.5, by = 0.1) # effect strength (0 = no location effect, 1 = observed)
+lam_grid  <- c(0.05, 0.1, 0.15, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4)  # sample-size scaling factors
+B_lambda  <- 2000                  # replications per lambda
+```
+
+```{r c2-sim-helpers}
+Y_obs  <- split(an$percent_offer, factor(an$stakes, levels = stakes_order))
+n_obs  <- lengths(Y_obs)
+pooled <- unlist(Y_obs, use.names = FALSE)
+pair_i <- match(sim_pair, stakes_order)
+
+# Mann-Whitney count #(a < b) + 0.5 #(a == b), via midranks
+mw_less <- function(a, b) {
+  r <- rank(c(a, b)); na <- length(a)
+  length(a) * length(b) - (sum(r[seq_len(na)]) - na * (na + 1) / 2)
+}
+
+# Fast tie-corrected Jonckheere-Terpstra p-value, alternative: decreasing in stakes
+jt_dec <- function(ys) {
+  k <- length(ys); W <- 0
+  for (i in 1:(k - 1)) for (j in (i + 1):k) W <- W + mw_less(ys[[j]], ys[[i]])
+  x <- unlist(ys); n <- lengths(ys); N <- sum(n); t <- as.numeric(table(x))
+  E <- (N^2 - sum(n^2)) / 4
+  V <- (N * (N - 1) * (2 * N + 5) - sum(n * (n - 1) * (2 * n + 5)) -
+          sum(t * (t - 1) * (2 * t + 5))) / 72 +
+       sum(n * (n - 1) * (n - 2)) * sum(t * (t - 1) * (t - 2)) / (36 * N * (N - 1) * (N - 2)) +
+       sum(n * (n - 1)) * sum(t * (t - 1)) / (8 * N * (N - 1))
+  pnorm((W - E) / sqrt(V), lower.tail = FALSE)
+}
+
+# p-values of the three tests on one simulated data set (list of 4 groups),
+# plus the realised effect in the focus pair
+one_rep_h1 <- function(ys) {
+  a <- ys[[pair_i[1]]]; b <- ys[[pair_i[2]]]
+  c(ttest   = t.test(a, b, var.equal = TRUE)$p.value,
+    wilcox  = suppressWarnings(wilcox.test(a, b, exact = FALSE)$p.value),
+    jt      = jt_dec(ys),
+    d_mean  = mean(a) - mean(b),
+    d_hl    = median(outer(a, b, "-")))
+}
+
+pseudo_median <- function(y) {
+  w <- outer(y, y, "+") / 2
+  median(w[upper.tri(w, diag = TRUE)])
+}
+
+# DGP: shift every group towards the overall location, re-add s * effect, cap to [0, 1]
+make_dgp_h1 <- function(center = c("mean", "hl")) {
+  center <- match.arg(center)
+  loc   <- if (center == "mean") mean else pseudo_median
+  theta <- sapply(Y_obs, loc) - loc(pooled)
+  function(s = 1, lam = 1) {
+    mapply(function(y, th, n) {
+      pmin(pmax(sample(y, round(lam * n), replace = TRUE) - (1 - s) * th, 0), 1)
+    }, Y_obs, theta, n_obs, SIMPLIFY = FALSE)
+  }
+}
+
+rej_h1 <- function(r) colMeans(r[, c("ttest", "wilcox", "jt"), drop = FALSE] < alpha, na.rm = TRUE)
+```
+
+**Size and power at the observed effect.** As in Case 1, the size is checked under the pooled null hypothesis by drawing all four groups from the pooled offers, so that $H_0$ holds exactly and ties and focal points are preserved. Power at the observed effect resamples each group from its own observed offers.
+
+```{r c2-sim-size, cache=TRUE, dependson="c2-sim-params"}
+set.seed(1)
+size_h1 <- t(replicate(B_size, one_rep_h1(lapply(n_obs, function(n) sample(pooled, n, TRUE)))))
+set.seed(2)
+pow_h1  <- t(replicate(B_size, one_rep_h1(lapply(Y_obs, function(y) sample(y, length(y), TRUE)))))
+
+data.frame(test = c(paste("t-test", paste(sim_pair, collapse = " vs ")),
+                    paste("Wilcoxon", paste(sim_pair, collapse = " vs ")),
+                    "Jonckheere-Terpstra (all four groups)"),
+           size = rej_h1(size_h1),
+           size_mc_se = sqrt(rej_h1(size_h1) * (1 - rej_h1(size_h1)) / B_size),
+           power_at_observed = rej_h1(pow_h1)) %>%
+  knitr::kable(digits = 4, row.names = FALSE)
+```
+
+**Power curves.** For each effect strength $s$, the shifted groups are resampled with the original group sizes. The realised mean and HL difference in the focus pair are recorded, since capping can make them deviate from the target.
+
+```{r c2-sim-curves, cache=TRUE, dependson="c2-sim-params"}
+curves_h1 <- bind_rows(lapply(c("mean"), function(ct) {   # HL shift is 0 for Rs 20 and Rs 200 (focal points)
+  dgp <- make_dgp_h1(ct)
+  set.seed(3)
+  bind_rows(lapply(s_grid, function(sv) {
+    r <- t(replicate(B_curve, one_rep_h1(dgp(sv))))
+    data.frame(center = ct, s = sv, method = c("ttest", "wilcox", "jt"),
+               power = rej_h1(r), real_mean = mean(r[, "d_mean"]),
+               real_hl = mean(r[, "d_hl"]), n_sim = B_curve)
+  }))
+})) %>%
+  mutate(center = factor(center, c("mean", "hl"),
+                         c("Centred on means", "Centred on HL location")),
+         method = factor(method, c("ttest", "wilcox", "jt"),
+                         c(paste0("t-test (", paste(sim_pair, collapse = " vs "), ")"),
+                           paste0("Wilcoxon (", paste(sim_pair, collapse = " vs "), ")"),
+                           "Jonckheere (all groups)")),
+         se = sqrt(power * (1 - power) / n_sim))
+
+curves_h1 %>% filter(s %in% c(0, 0.5, 1, 1.5)) %>%
+  select(center, s, method, power, real_mean, real_hl) %>%
+  knitr::kable(digits = 3, row.names = FALSE)
+```
+
+```{r c2-fig-sim-curves, fig.width=7, fig.height=4.5, dpi=300, fig.retina=1, fig.process=thesis_fig("case2-h1-power")}
+ggplot(curves_h1, aes(s, power, colour = method)) +
+  geom_hline(yintercept = alpha, linetype = "dashed", colour = "gray50") +
+  geom_vline(xintercept = 1, linetype = "dotted", colour = "gray40") +
+  geom_line(linewidth = 1) + geom_point(size = 1.6) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Effect strength s (0 = groups centred, 1 = observed)",
+       y = "Rejection rate at α = 0.05", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+```
+
+The figures below show how the shift moves the focal points of the offers (mean centring, no resampling; Appendix of the thesis). Each group $g$ is shifted by $-(1 - s)\hat\theta_g$, so tied offers of different groups separate for $s \neq 1$.
+
+```{r c2-fig-ties-data}
+theta_mean <- sapply(Y_obs, mean) - mean(pooled)
+ties_at <- function(s) {
+  bind_rows(lapply(seq_along(Y_obs), function(g) {
+    data.frame(stakes = names(Y_obs)[g],
+               offer = round(100 * pmin(pmax(Y_obs[[g]] - (1 - s) * theta_mean[g], 0), 1), 1))
+  })) %>%
+    mutate(stakes = factor(stakes, stakes_order, c("Rs 20", "Rs 200", "Rs 2,000", "Rs 20,000"))) %>%
+    count(stakes, offer) %>% group_by(stakes) %>% mutate(share = n / sum(n)) %>% ungroup()
+}
+plot_ties <- function(s) {
+  # tied offers of different groups are stacked at the same value
+  ggplot(ties_at(s), aes(offer, share, fill = stakes)) +
+    geom_col(position = position_stack(reverse = TRUE), width = 0.25) +   # narrow: nearby but untied values stay separate
+    coord_cartesian(xlim = c(0, 55)) +
+    scale_x_continuous(breaks = seq(0, 55, 5)) +
+    labs(x = "Offer (% of the pie)", y = "Share of offers in the stake group", fill = NULL,
+         title = sprintf("s = %s", format(s))) +
+    theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+}
+round(theta_mean * 100, 2)   # shift of each group at s = 0, in percentage points
+```
+
+```{r c2-fig-ties-s0, fig.width=10, fig.height=4, dpi=300, fig.retina=1, fig.process=thesis_fig("case2-h1-ties-s0")}
+plot_ties(0)
+```
+
+```{r c2-fig-ties-s05, fig.width=10, fig.height=4, dpi=300, fig.retina=1, fig.process=thesis_fig("case2-h1-ties-s05")}
+plot_ties(0.5)
+```
+
+```{r c2-fig-ties-s1, fig.width=10, fig.height=4, dpi=300, fig.retina=1, fig.process=thesis_fig("case2-h1-ties-s1")}
+plot_ties(1)
+```
+
+The $t$-test reacts smoothly to the effect strength, but the rank tests do not. The Wilcoxon test stays at about 9% for all $s$ between 0.1 and 0.9, jumps to 74% at $s = 1$ and to almost 100% at $s = 1.1$, and the Jonckheere test shows similar jumps. As explained in Section 3.5 of the thesis, the shift breaks the ties at the focal offers of 10% and 25%: at $s = 1$, many offers in different stake groups are tied, and any $s \neq 1$ moves the groups by slightly different amounts, so that thousands of formerly tied pairs count either all for or all against the alternative. The power at the observed effect and the sample-size simulation, which resample the observed offers without shifting them, are therefore used for the comparison.
+
+**Required sample size.** All four groups are scaled by a common factor $\lambda$ and resampled from the observed offers ($s = 1$). The required sample size is read off by linear interpolation between neighbouring grid points.
+
+```{r c2-sim-sizing, cache=TRUE, dependson="c2-sim-params"}
+set.seed(4)
+sizing_h1 <- bind_rows(lapply(lam_grid, function(lam) {
+  r <- t(replicate(B_lambda, one_rep_h1(
+    lapply(Y_obs, function(y) sample(y, round(lam * length(y)), TRUE)))))
+  data.frame(lambda = lam, N_total = sum(round(lam * n_obs)),
+             n_pair = sum(round(lam * n_obs[pair_i])),
+             method = c("ttest", "wilcox", "jt"), power = rej_h1(r), n_sim = B_lambda)
+}))
+
+lam_for <- function(lam, p, target) {
+  if (max(p) < target) return(NA_real_)
+  approx(p, lam, xout = target, ties = "ordered")$y
+}
+sizing_h1 %>% group_by(method) %>%
+  summarise(lambda_80 = lam_for(lambda, power, 0.8),
+            lambda_90 = lam_for(lambda, power, 0.9), .groups = "drop") %>%
+  mutate(N_total_80 = round(lambda_80 * sum(n_obs)),
+         n_pair_80  = round(lambda_80 * sum(n_obs[pair_i])),
+         N_total_90 = round(lambda_90 * sum(n_obs)),
+         n_pair_90  = round(lambda_90 * sum(n_obs[pair_i]))) %>%
+  knitr::kable(digits = 2)
+```
+
+```{r c2-fig-sim-sizing, fig.width=8, fig.height=5, dpi=300, fig.retina=1, fig.process=thesis_fig("case2-h1-samplesize")}
+sizing_h1 %>%
+  mutate(method = factor(method, c("ttest", "wilcox", "jt"),
+                         c(paste0("t-test (", paste(sim_pair, collapse = " vs "), ")"),
+                           paste0("Wilcoxon (", paste(sim_pair, collapse = " vs "), ")"),
+                           "Jonckheere (all groups)")),
+         se = sqrt(power * (1 - power) / n_sim)) %>%
+  ggplot(aes(lambda, power, colour = method)) +
+  geom_hline(yintercept = c(0.8, 0.9), linetype = "dashed", colour = "gray50") +
+  geom_vline(xintercept = 1, linetype = "dotdash", colour = "gray30") +
+  geom_errorbar(aes(ymin = power - 1.96 * se, ymax = power + 1.96 * se),
+                width = 0.03, alpha = 0.4) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  scale_x_continuous(name = expression("Scaling factor " * lambda),
+                     sec.axis = sec_axis(~ . * sum(n_obs[pair_i]),
+                                         name = paste("n in the pair", paste(sim_pair, collapse = " vs ")))) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(y = "Power at α = 0.05", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+```
+
+Both pairwise tests hold their nominal size under the pooled null hypothesis ($t$-test 4.5%, Wilcoxon 4.9%), and so does the Jonckheere test (5.5%, within two simulation standard errors of 5%). At the observed effect, the Wilcoxon test detects the difference between Rs 200 and Rs 2,000 in 74% of the replications, the $t$-test only in 47%. To reach 80% power for this comparison, the Wilcoxon test needs about 270 offers in the two groups, the $t$-test about 540, i.e. twice as many and more than twice the 233 actually observed. The Jonckheere test, which uses all four groups and the full ordering, reaches 80% power already with about 45 offers in total, a tenth of the published sample.
+
+## RH2: Responses
+
+### Data diagnostics and fit of the original analysis: responses
+
+The outcome is binary, so the full information per cell is a count of rejections out of a number of responders. Table 1 of the paper (sample sizes) and Table 2 (rejection rates) are reproduced below.
+
+```{r c2-desc-responses}
+an %>%
+  group_by(wealth_f, stakes_f) %>%
+  summarise(n = n(), rejections = sum(reject), rate = mean(reject), .groups = "drop") %>%
+  bind_rows(an %>% group_by(stakes_f) %>%
+              summarise(n = n(), rejections = sum(reject), rate = mean(reject)) %>%
+              mutate(wealth_f = "All")) %>%
+  mutate(cell = sprintf("%.1f%% (%d/%d)", 100 * rate, rejections, n)) %>%
+  select(wealth_f, stakes_f, cell) %>%
+  pivot_wider(names_from = stakes_f, values_from = cell) %>%
+  knitr::kable()
+```
+
+```{r c2-fig-rates, fig.width=9, fig.height=4, dpi=300, fig.retina=1, fig.process=thesis_fig("case2-h2-rejections")}
+ci_df <- an %>%
+  group_by(group = "All", stakes_f) %>%
+  summarise(k = sum(reject), n = n(), .groups = "drop") %>%
+  bind_rows(an %>% group_by(group = as.character(wealth_f), stakes_f) %>%
+              summarise(k = sum(reject), n = n(), .groups = "drop")) %>%
+  rowwise() %>%
+  mutate(rate = k / n,
+         lo = binom.test(k, n)$conf.int[1], hi = binom.test(k, n)$conf.int[2]) %>%
+  ungroup() %>%
+  mutate(group = factor(group, c("All", "No wealth", "Wealth")))
+
+p_rates <- ggplot(ci_df, aes(stakes_f, rate, colour = group, group = group)) +
+  geom_line(position = position_dodge(0.3)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), position = position_dodge(0.3)) +
+  labs(x = "Stakes", y = "Rejection rate", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+
+p_offer <- ggplot(an, aes(stakes_f, percent_offer)) +
+  geom_boxplot(fill = "gray85", outlier.size = 1) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, colour = "firebrick") +
+  labs(x = "Stakes", y = "Share of pie offered") +
+  theme_minimal(base_size = 12)
+
+p_rates + p_offer
+```
+
+The left panel shows the rejection rates with exact (Clopper–Pearson) 95% confidence intervals. The intervals for Rs 20 and Rs 200 overlap almost completely, and the Rs 20,000 interval is wide because it rests on 24 observations. The right panel shows that the median offer drops from 25% of the pie at Rs 20 to 7.5% at Rs 20,000. Mean offers are marked in red.
+
+Four features of the data matter for the choice of test:
+
+1. **Binary outcome and ties.** `reject` takes only two values, so every rank-based test operates with massive ties: all 157 rejections share one mid-rank, all 301 acceptances another. Rank tests must therefore use the tie-corrected variance. With two outcome categories, the data is exactly a 2×4 contingency table.
+2. **Unbalanced and very small cells.** The Rs 20 cell has 201 responders, the Rs 20,000 cell only 24, with a single rejection. Within the wealth split, the top cells have 12 responders each. Asymptotic p-values should therefore be checked against permutation p-values.
+3. **A violated ordering.** Pooled, the rejection rate *rises* from 36.3% at Rs 20 to 42.7% at Rs 200 before it falls to 27.5% and 4.2%. The inversion comes entirely from the wealth group (34.7% → 47.3%). In the no-wealth group the rates fall monotonically (46.4% → 36.0% → 19.6% → 0%). Since 86% of the Rs 20 responders are in the wealth condition, compared with 50% at Rs 20,000, pooled comparisons are partly comparisons of different wealth mixes, so the tests are reported by wealth group as well as pooled.
+4. **Offers fall with the stakes.** Proposers offer a smaller share at higher stakes, and lower offers are rejected more often. Unconditional rejection rates therefore mix the stakes effect with an offer effect that works in the opposite direction.
+
+### Test choice and justification: responses
+
+Following the decision table of the thesis (Section 3.4), the diagnostics call for tests of the ordered alternative that tolerate a violated order, with exact or tie-corrected inference, and for a stratification by the offer. Pairwise Wilcoxon tests are not repeated, because for a binary outcome they coincide with the authors' $z$-tests of proportions (verified below).
+
+What matters for RH2 is the structure of the hypothesis as a whole: four independent groups and an alternative that predicts a direction. Tests for ordered alternatives fit this structure better than Fisher's omnibus test, which would reject just as readily if rejection rose with the stakes.
+
+* **Jonckheere–Terpstra test.** It sums the Mann–Whitney statistics of all pairs of groups in the hypothesised order. If the order holds, it is more powerful than an omnibus test. The inversion between Rs 20 and Rs 200, however, counts as evidence against the alternative, all the more since Rs 20 and Rs 200 are the two largest groups.
+* **Chacko–Shorack test.** Adjacent groups whose mean ranks violate the hypothesised order are merged (pool-adjacent-violators), and a Kruskal–Wallis-type statistic is computed on the merged groups, so the inversion counts as no effect rather than as counter-evidence. Its null distribution is a mixture of $\chi^2$ distributions (chi-bar-squared).
+
+For a directional hypothesis with an observed inversion, the Chacko–Shorack test is therefore the natural choice, and the Jonckheere test shows what is lost if the inversion is ignored. Because of the small top cell, both ordered tests are evaluated with permutation p-values (20,000 random permutations) in addition to their asymptotic ones. For the Jonckheere test, the asymptotic p-value must use the tie-corrected variance: with a binary outcome, more than half of all pairs are tied, and the uncorrected variance (used, for instance, by the normal approximation in `DescTools::JonckheereTerpstraTest`) is far too large, which makes the test very conservative. To condition on the offer, as the authors' logit does, both ordered tests are also stratified by the offer bands of Figure 4 of the paper.
+
+### Results: responses
+
+#### Replication of the original analysis
+
+The authors test whether rejection rates differ across the four stake levels, separately for the two wealth groups, with Fisher's exact test on the 2×4 table.
+
+```{r c2-fisher}
+fisher_chi <- function(dd) {
+  tb <- table(dd$reject, dd$stakes)
+  c(fisher = fisher.test(tb)$p.value,
+    chi2   = suppressWarnings(chisq.test(tb)$p.value))
+}
+rbind("No wealth" = fisher_chi(filter(an, wealth == 0)),
+      "Wealth"    = fisher_chi(filter(an, wealth == 1)),
+      "Pooled"    = fisher_chi(an)) %>%
+  round(4)
+```
+
+Fisher's test reproduces the paper (p = 0.005 without wealth, p = 0.038 with wealth). Both tests are *omnibus* tests. They ask whether the rejection rates are equal across the four stake levels and would reject just as strongly if the rates rose with the stakes. The research hypothesis of the paper, however, is directional.
+
+In the pooled data, the authors compare all six pairs of stake levels with two-sample $z$-tests of proportions (Stata `prtest`, i.e. without continuity correction). For a binary outcome, the Wilcoxon statistic is a linear function of the difference in the two proportions, and its tie-corrected standardised version equals the $z$-statistic up to the factor $\sqrt{(N-1)/N}$. The chunk below verifies this.
+
+```{r c2-prtest}
+pr_tab <- bind_rows(lapply(pairs_stakes, function(p) {
+  sub <- filter(an, stakes %in% p)
+  a <- sub$reject[sub$stakes == p[1]]; b <- sub$reject[sub$stakes == p[2]]
+  data.frame(pair = paste(p, collapse = " vs "),
+             rate_1 = mean(a), rate_2 = mean(b),
+             p_ztest = prop.test(c(sum(a), sum(b)), c(length(a), length(b)),
+                                 correct = FALSE)$p.value,
+             p_wilcoxon = wilcox.test(a, b, exact = FALSE, correct = FALSE)$p.value)
+}))
+knitr::kable(pr_tab, digits = 4, row.names = FALSE)
+```
+
+The $z$-tests match the paper: 20 vs 200 (p = 0.25) and 20 vs 2,000 (p = 0.12) are not significant, all comparisons involving Rs 20,000 are, and so is 200 vs 2,000. The Wilcoxon p-values differ from them by at most 0.0004, so the pairwise comparisons are not analysed further.
+
+```{r c2-logit}
+m_logit <- glm(reject ~ wealth + stakes_2 + stakes_3 + stakes_4 + percent_offer,
+               data = an, family = binomial)
+knitr::kable(coef(summary(m_logit)), digits = 3)
+```
+
+The coefficients reproduce Table 3 of the paper. Controlling for the share offered, the stakes dummies for Rs 2,000 and Rs 20,000 are significantly negative, Rs 200 is not, and a larger offer share lowers the rejection probability.
+
+#### Rank-based tests, pooled data
+
+```{r c2-pooled, cache=TRUE}
+cs_pooled <- chacko_stat(an$reject, an$stakes)
+rbind(mean_rank = cs_pooled$mean_ranks, after_amalgamation = cs_pooled$isotonic) %>%
+  round(1)
+
+res_pooled <- rank_tests(an)
+knitr::kable(res_pooled, digits = 4)
+```
+
+The mean ranks of `reject` (higher = more rejections) show the inversion: Rs 200 has a higher mean rank than Rs 20. The Chacko–Shorack test merges the two groups into one block with their weighted average rank and leaves three levels.
+
+Both ordered tests reject $H_0$, but they differ in strength in a way that follows directly from the inversion. The Jonckheere test (p = 0.013) is more than thirty times weaker than the authors' omnibus Fisher test (p = 0.0004), although it is designed for exactly this directional hypothesis. The pairs between Rs 20 and Rs 200 make up the largest share of all between-group comparisons (201 × 124 pairs), and in these pairs rejection goes the "wrong" way. The Chacko–Shorack test does not suffer from this and gives the smallest p-value (p = 0.0002), slightly below the pooled Fisher test. Asymptotic and permutation p-values agree closely for both tests.
+
+#### Rank-based tests by wealth group
+
+The authors report their main tests separately for the two wealth groups, where the cells are much smaller.
+
+```{r c2-wealth, cache=TRUE}
+res_wealth <- bind_rows(
+  rank_tests(filter(an, wealth == 0)) %>% mutate(group = "No wealth (n = 136)"),
+  rank_tests(filter(an, wealth == 1)) %>% mutate(group = "Wealth (n = 322)")) %>%
+  left_join(data.frame(group = c("No wealth (n = 136)", "Wealth (n = 322)"),
+                       fisher = c(fisher_chi(filter(an, wealth == 0))["fisher"],
+                                  fisher_chi(filter(an, wealth == 1))["fisher"])),
+            by = "group") %>%
+  select(group, test, statistic, p_asymptotic, p_permutation, fisher)
+knitr::kable(res_wealth, digits = 4)
+
+rbind("No wealth" = chacko_stat(filter(an, wealth == 0)$reject, filter(an, wealth == 0)$stakes)$mean_ranks,
+      "Wealth"    = chacko_stat(filter(an, wealth == 1)$reject, filter(an, wealth == 1)$stakes)$mean_ranks) %>%
+  round(1)
+```
+
+In the **no-wealth** group, the rejection rates fall monotonically. No groups are merged, so the Chacko–Shorack statistic equals the ordinary Kruskal–Wallis statistic, but it is compared with the chi-bar-squared rather than the $\chi^2$ distribution, which accounts for the fact that only one direction is tested. Here the ordering is fully informative: the Jonckheere test (p = 0.0006) and the Chacko–Shorack test (p = 0.0012) give p-values roughly eight and four times smaller than Fisher's exact test (p = 0.0046).
+
+In the **wealth** group, the Rs 20/Rs 200 inversion is pronounced, and the Jonckheere test breaks down completely (p = 0.43). The Chacko–Shorack test merges the two low-stakes groups and still rejects at the 5% level (p = 0.038). It does not gain over Fisher's test (p = 0.038), however: once the two lowest groups are merged, little ordering information remains that an omnibus test does not also use.
+
+#### Brunner–Munzel check
+
+For completeness, the Brunner–Munzel test (see the offers above) is also applied to the six pairwise comparisons of the rejection rates, as the counterpart of the authors' pairwise $z$-tests.
+
+```{r c2-bm-responses, cache=TRUE}
+bm_rej <- bind_rows(lapply(pairs_stakes, function(p) {
+  a <- an$reject[an$stakes == p[2]]; b <- an$reject[an$stakes == p[1]]   # higher vs lower stakes
+  data.frame(pair = paste(p, collapse = " vs "),
+             p_wilcoxon = suppressWarnings(wilcox.test(b, a, exact = FALSE, correct = FALSE)$p.value),
+             t(bm_test(a, b)))
+}))
+knitr::kable(bm_rej, digits = 4, row.names = FALSE)
+```
+
+The Brunner–Munzel test leads to the same conclusion as the Wilcoxon and $z$-tests for every pair.
+
+#### Resampling simulations
+
+The simulation compares the authors' Fisher test with the Jonckheere–Terpstra and Chacko–Shorack tests. As described for binary outcomes in Section 3.5 of the thesis, the shift is applied to the rejection rate rather than to the binary values. For a 0/1 outcome, the empirical distribution of group $g$ is completely described by its rejection rate $\hat p_g$, so resampling from the group is identical to drawing Bernoulli($\hat p_g$).
+
+1. *Isolate the effect:* $\hat\theta_g = \hat p_g - \bar p$, the distance of each stake group from the overall rejection rate.
+2. *Remove and re-add it with strength $s$:* $p_g(s) = \bar p + s\,\hat\theta_g$. With $s = 0$ all groups share the overall rate, which is exactly $H_0$; $s = 1$ reproduces the observed rates.
+3. *Cap:* $p_g(s)$ is truncated to $[0, 1]$. This binds for $s > 1$, e.g. at Rs 20,000, where $\hat\theta_g = 0.042 - 0.343 = -0.30$.
+4. *Resample:* $n_g(\lambda) = \mathrm{round}(\lambda n_g)$ Bernoulli($p_g(s)$) draws per group.
+
+A separate Hodges–Lehmann variant is not needed: for a 0/1 outcome the pairwise differences are only −1, 0 or 1, so the HL shift is degenerate, and centring the groups on the overall mean rank is the same as centring them on the overall rate. To vary the *shape* of the effect, three patterns are simulated, each with its own group sizes: the pooled data (moderate inversion), the no-wealth group (monotone) and the wealth group (pronounced inversion).
+
+```{r c2-sim2-params, cache=TRUE}
+# ---- Parameters (change here) ---------------------------------------------
+s_grid2   <- seq(0, 1.5, by = 0.1)
+B_size2   <- 5000
+B_curve2  <- 2000
+lam_grid2 <- c(0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4)
+B_lambda2 <- 2000
+B_levels  <- 2e4     # draws for the chi-bar-squared level probabilities
+```
+
+```{r c2-sim2-helpers}
+scen <- list("Pooled"    = an,
+             "No wealth" = filter(an, wealth == 0),
+             "Wealth"    = filter(an, wealth == 1))
+scen_par <- lapply(scen, function(dd) {
+  n <- as.numeric(table(factor(dd$stakes, levels = stakes_order)))
+  p <- as.numeric(tapply(dd$reject, factor(dd$stakes, levels = stakes_order), mean))
+  list(n = n, p = p, pbar = mean(dd$reject))
+})
+
+# Chi-bar-squared level probabilities depend only on the group sizes:
+# compute them once per vector of group sizes (groups reversed: decreasing alternative)
+level_probs <- function(n, B = B_levels, seed = 1) {
+  set.seed(seed); w <- rev(n); k <- length(w)
+  tabulate(replicate(B, pava(rnorm(k, 0, sqrt(1 / w)), w)$n_levels), nbins = k) / B
+}
+
+# Fast tie-corrected Chacko-Shorack p-value (chi-bar-squared) for a decreasing alternative
+cs_p <- function(x, g, lev) {
+  N <- length(x); r <- rank(x)
+  ni <- rev(as.numeric(tabulate(g, 4))); Ri <- rev(as.numeric(tapply(r, factor(g, 1:4), mean)))
+  ok <- ni > 0
+  iso <- pava(Ri[ok], ni[ok])
+  tt <- table(x); C <- 1 - sum(tt^3 - tt) / (N^3 - N)
+  K <- 12 / (N * (N + 1)) * sum(ni[ok] * (iso$fit - (N + 1) / 2)^2) / C
+  sum(sapply(2:length(lev), function(i) lev[i] * pchisq(K, df = i - 1, lower.tail = FALSE)))
+}
+
+one_rep_h2 <- function(n, p, lev) {
+  g <- rep(1:4, n)
+  x <- rbinom(length(g), 1, rep(p, n))
+  if (length(unique(x)) < 2) return(c(fisher = 1, jt = 1, cs = 1))
+  c(fisher = fisher.test(table(factor(x, 0:1), factor(g, 1:4)))$p.value,
+    jt     = jt_dec(split(x, factor(g, 1:4))),
+    cs     = cs_p(x, g, lev))
+}
+
+# smallest N with target power (linear interpolation between grid points)
+n_for <- function(n, p, target) {
+  if (max(p) < target) return(NA_real_)
+  if (min(p) >= target) return(min(n))
+  approx(p, n, xout = target, ties = "ordered")$y
+}
+
+rates_s <- function(par, s) pmin(pmax(par$pbar + s * (par$p - par$pbar), 0), 1)
+rej_h2  <- function(r) colMeans(r < alpha, na.rm = TRUE)
+lab_h2  <- c(fisher = "Fisher's exact (paper)", jt = "Jonckheere-Terpstra",
+             cs = "Chacko-Shorack")
+```
+
+**Size and power at the observed rates.**
+
+```{r c2-sim2-size, cache=TRUE, dependson="c2-sim2-params"}
+size_pow_h2 <- bind_rows(lapply(names(scen_par), function(sc) {
+  par <- scen_par[[sc]]; lev <- level_probs(par$n)
+  set.seed(11)
+  r0 <- t(replicate(B_size2, one_rep_h2(par$n, rates_s(par, 0), lev)))
+  set.seed(12)
+  r1 <- t(replicate(B_size2, one_rep_h2(par$n, rates_s(par, 1), lev)))
+  data.frame(scenario = sc, test = lab_h2[colnames(r0)],
+             size = rej_h2(r0), power_observed = rej_h2(r1))
+}))
+knitr::kable(size_pow_h2, digits = 3, row.names = FALSE)
+```
+
+**Power curves.**
+
+```{r c2-sim2-curves, cache=TRUE, dependson="c2-sim2-params"}
+curves_h2 <- bind_rows(lapply(names(scen_par), function(sc) {
+  par <- scen_par[[sc]]; lev <- level_probs(par$n)
+  set.seed(13)
+  bind_rows(lapply(s_grid2, function(sv) {
+    r <- t(replicate(B_curve2, one_rep_h2(par$n, rates_s(par, sv), lev)))
+    data.frame(scenario = sc, s = sv, method = lab_h2[colnames(r)],
+               power = rej_h2(r), rate_top = rates_s(par, sv)[4], n_sim = B_curve2)
+  }))
+})) %>%
+  mutate(scenario = factor(scenario, names(scen_par)),
+         method = factor(method, lab_h2),
+         se = sqrt(power * (1 - power) / n_sim))
+
+# capped target rates for selected s
+bind_rows(lapply(names(scen_par), function(sc) {
+  sapply(c(0, 0.5, 1, 1.5), function(sv) round(rates_s(scen_par[[sc]], sv), 3)) %>%
+    t() %>% as.data.frame() %>% setNames(paste("Rs", stakes_order)) %>%
+    mutate(scenario = sc, s = c(0, 0.5, 1, 1.5), .before = 1)
+})) %>% knitr::kable()
+```
+
+```{r c2-fig-sim2-curves, fig.width=11, fig.height=4.5, dpi=300, fig.retina=1, fig.process=thesis_fig("case2-h2-power")}
+ggplot(curves_h2, aes(s, power, colour = method)) +
+  geom_hline(yintercept = alpha, linetype = "dashed", colour = "gray50") +
+  geom_vline(xintercept = 1, linetype = "dotted", colour = "gray40") +
+  geom_errorbar(aes(ymin = power - 1.96 * se, ymax = power + 1.96 * se),
+                width = 0.02, alpha = 0.4) +
+  geom_line(linewidth = 1) + geom_point(size = 1.6) +
+  facet_wrap(~ scenario) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Effect strength s (0 = all groups at the overall rate, 1 = observed)",
+       y = "Rejection rate at α = 0.05", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+```
+
+**Required sample size.**
+
+```{r c2-sim2-sizing, cache=TRUE, dependson="c2-sim2-params"}
+sizing_h2 <- bind_rows(lapply(names(scen_par), function(sc) {
+  par <- scen_par[[sc]]
+  set.seed(14)
+  bind_rows(lapply(lam_grid2, function(lam) {
+    n_l <- round(lam * par$n); lev <- level_probs(n_l)
+    r <- t(replicate(B_lambda2, one_rep_h2(n_l, rates_s(par, 1), lev)))
+    data.frame(scenario = sc, lambda = lam, N = sum(n_l), n_top = n_l[4],
+               method = lab_h2[colnames(r)], power = rej_h2(r), n_sim = B_lambda2)
+  }))
+})) %>%
+  mutate(scenario = factor(scenario, names(scen_par)), method = factor(method, lab_h2))
+
+sizing_h2 %>% group_by(scenario, method) %>%
+  summarise(N_published = N[lambda == 1],
+            N_80 = round(n_for(N, power, 0.8)), N_90 = round(n_for(N, power, 0.9)),
+            .groups = "drop") %>%
+  knitr::kable()
+```
+
+```{r c2-fig-sim2-sizing, fig.width=11, fig.height=4.5, dpi=300, fig.retina=1}
+sizing_h2 %>% mutate(se = sqrt(power * (1 - power) / n_sim)) %>%
+  ggplot(aes(N, power, colour = method)) +
+  geom_hline(yintercept = c(0.8, 0.9), linetype = "dashed", colour = "gray50") +
+  geom_vline(data = sizing_h2 %>% filter(lambda == 1) %>% distinct(scenario, N),
+             aes(xintercept = N), linetype = "dotdash", colour = "gray30") +
+  geom_errorbar(aes(ymin = power - 1.96 * se, ymax = power + 1.96 * se),
+                width = 0, alpha = 0.4) +
+  geom_line(linewidth = 1) + geom_point(size = 1.6) +
+  facet_wrap(~ scenario, scales = "free_x") +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Total sample size N", y = "Power at α = 0.05", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+```
+
+All three tests hold their nominal size in all three scenarios (4.2%–5.1%). Which test is most powerful depends on the *shape* of the effect:
+
+* **Monotone effect (no wealth).** The two ordered tests dominate. At the observed rates, Fisher's test reaches 94% power, the Jonckheere test 98% and the Chacko–Shorack test 99%. For 80% power, the Jonckheere test needs about 66 responders, the Chacko–Shorack test about 79 and Fisher's test about 110.
+* **Moderate inversion (pooled).** The Jonckheere test loses much of its power (74% at the observed rates, about 524 responders for 80% power), while the Chacko–Shorack test remains the most powerful test (99.7%, about 208 responders), ahead of Fisher's test (99%, about 252).
+* **Pronounced inversion (wealth).** The Jonckheere test has essentially no power (6%), regardless of the effect strength or the sample size. The Chacko–Shorack test still works (63%), but Fisher's omnibus test is slightly more powerful (72%; about 377 vs 433 responders for 80% power): after the two low-stakes groups are merged, little ordering information is left.
+
+The Chacko–Shorack test is therefore the most robust choice: it is close to the best test in every scenario, whereas the Jonckheere test is the best test for a monotone effect but fails completely when the ordering is violated.
+
+#### Conditioning on the offer
+
+The unconditional tests above compare responders who received very different offers: proposers offer less at higher stakes, and low offers are rejected more often. The authors' logit regression (Table 3) addresses this by controlling for `percent_offer`. A rank-based counterpart combines the Jonckheere and Chacko–Shorack tests with the blocking idea of the van Elteren test (stratified Wilcoxon test; Section 3.4 of the thesis):
+
+1. **Blocks.** Responders are grouped by the share they were offered, so that within a block all offers are about equally (un)fair.
+2. **Statistic within each block.** For the Jonckheere test, every pair of responders in the same block with different stakes scores 1 if the lower-stakes responder rejected and the higher-stakes responder accepted, 0 in the reverse case and ½ if both decided the same way.
+3. **Combination.** For the Jonckheere test, the block statistics are added up with weights $c_k = 1/(N_k + 1)$, as in the van Elteren test, so that large blocks do not dominate. For the Chacko–Shorack test, the block statistics are summed.
+4. **Null distribution.** Stakes labels are permuted *within* blocks, which keeps the offer composition of every block fixed. The asymptotic version of the Jonckheere test uses the tie-corrected mean and variance of each block.
+
+The default uses the offer bands of Figure 4 of the paper (≤ 10%, 10–20%, 20–30%, > 30%). These are the natural *pre-specified* choice; choosing the number of blocks by looking at the resulting p-values would invalidate the test, so the sensitivity table further below is a robustness check, not a tuning device.
+
+```{r c2-strat-params, cache=TRUE}
+# ---- Parameters (change here) ---------------------------------------------
+use_paper_bands <- TRUE    # TRUE: offer bands <=10%, 10-20%, 20-30%, >30% (Figure 4)
+n_q             <- 4       # number of quantile-based offer blocks (if use_paper_bands = FALSE)
+block_by_wealth <- FALSE   # additionally split every block by wealth condition
+weighting       <- "combo" # "combo": c_k = 1 / (N_k + 1); "none": unweighted sum
+B_strat         <- 2e4     # permutations for the main result
+B_sens          <- 2000    # permutations per setting in the sensitivity table
+```
+
+```{r c2-strat-helpers}
+# Jonckheere components (statistic, null mean, tie-corrected null variance)
+# for a DECREASING alternative within one block
+jt_parts <- function(x, g) {
+  g <- factor(g, levels = rev(stakes_order)); lv <- levels(g); W <- 0
+  for (i in 1:(length(lv) - 1)) for (j in (i + 1):length(lv)) {
+    a <- x[g == lv[i]]; b <- x[g == lv[j]]
+    if (length(a) && length(b)) W <- W + sum(outer(a, b, "<")) + 0.5 * sum(outer(a, b, "=="))
+  }
+  n <- as.numeric(table(g)); N <- sum(n); t <- as.numeric(table(x))
+  E <- (N^2 - sum(n^2)) / 4
+  V <- if (N < 3 || length(t) < 2) 0 else
+    (N * (N - 1) * (2 * N + 5) - sum(n * (n - 1) * (2 * n + 5)) -
+       sum(t * (t - 1) * (2 * t + 5))) / 72 +
+    sum(n * (n - 1) * (n - 2)) * sum(t * (t - 1) * (t - 2)) / (36 * N * (N - 1) * (N - 2)) +
+    sum(n * (n - 1)) * sum(t * (t - 1)) / (8 * N * (N - 1))
+  c(W = W, E = E, V = V, N = N)
+}
+
+# Offer blocks: paper bands or quantiles (duplicate quantiles are merged,
+# since offers pile up on a few focal points)
+make_blocks <- function(dd, paper = use_paper_bands, q = n_q, by_wealth = block_by_wealth) {
+  off <- round(dd$percent_offer, 2)
+  br <- if (paper) c(-Inf, 0.10, 0.20, 0.30, Inf) else
+    unique(c(-Inf, quantile(off, seq(0, 1, length.out = q + 1))[-c(1, q + 1)], Inf))
+  blk <- cut(off, breaks = br, right = TRUE)
+  if (by_wealth) blk <- interaction(blk, dd$wealth, drop = TRUE)
+  droplevels(blk)
+}
+
+# Stratified Jonckheere with within-block permutation
+strat_jt <- function(x, g, blk, weight = weighting, B = B_strat, seed = 1) {
+  idx <- split(seq_along(x), blk)
+  stat <- function(gg) {
+    pr  <- sapply(idx, function(ix) jt_parts(x[ix], gg[ix]))
+    c_k <- if (weight == "combo") 1 / (pr["N", ] + 1) else rep(1, ncol(pr))
+    c(T = sum(c_k * pr["W", ]), E = sum(c_k * pr["E", ]), V = sum(c_k^2 * pr["V", ]))
+  }
+  s <- stat(g)
+  set.seed(seed)
+  null_T <- replicate(B, {
+    gg <- g
+    for (ix in idx) gg[ix] <- gg[ix][sample.int(length(ix))]
+    stat(gg)["T"]
+  })
+  data.frame(n_blocks = length(idx),
+             z = unname((s["T"] - s["E"]) / sqrt(s["V"])),
+             p_asymptotic = unname(pnorm((s["T"] - s["E"]) / sqrt(s["V"]), lower.tail = FALSE)),
+             p_permutation = (1 + sum(null_T >= s["T"])) / (B + 1))
+}
+```
+
+```{r c2-strat-main, cache=TRUE, dependson="c2-strat-params"}
+blk <- make_blocks(an)
+
+# Rejection rates by offer block and stakes (cf. Figure 4 of the paper)
+an %>% mutate(block = blk) %>%
+  group_by(block, stakes_f) %>%
+  summarise(cell = sprintf("%.2f (%d)", mean(reject), n()), .groups = "drop") %>%
+  pivot_wider(names_from = stakes_f, values_from = cell) %>%
+  knitr::kable()
+
+strat_res <- strat_jt(an$reject, an$stakes, blk)
+knitr::kable(strat_res, digits = 4)
+
+# Parametric counterpart: logit of Table 3, joint likelihood-ratio test of
+# the three stakes dummies (H0: stakes do not matter, given wealth and offer)
+m_logit0 <- update(m_logit, . ~ . - stakes_2 - stakes_3 - stakes_4)
+anova(m_logit0, m_logit, test = "LRT")
+```
+
+```{r c2-strat-cs, cache=TRUE, dependson="c2-strat-params"}
+# Stratified Chacko-Shorack: CS statistic within every offer block (only the stake groups
+# present in the block), summed over blocks; p-value by permuting stakes within blocks.
+cs_K <- function(x, g) {
+  lv <- stakes_order[stakes_order %in% g]
+  if (length(lv) < 2 || length(unique(x)) < 2) return(0)
+  g  <- factor(g, levels = lv)
+  N  <- length(x); r <- rank(x)
+  ni <- rev(as.numeric(tapply(r, g, length)))       # reversed: decreasing alternative
+  Ri <- rev(as.numeric(tapply(r, g, mean)))
+  iso <- pava(Ri, ni)
+  tt  <- table(x); C <- 1 - sum(tt^3 - tt) / (N^3 - N)
+  12 / (N * (N + 1)) * sum(ni * (iso$fit - (N + 1) / 2)^2) / C
+}
+strat_cs <- function(x, g, blk, B = B_strat, seed = 1) {
+  idx  <- split(seq_along(x), blk)
+  stat <- function(gg) sum(sapply(idx, function(ix) cs_K(x[ix], gg[ix])))
+  K <- stat(g)
+  set.seed(seed)
+  null_K <- replicate(B, {
+    gg <- g
+    for (ix in idx) gg[ix] <- gg[ix][sample.int(length(ix))]
+    stat(gg)
+  })
+  data.frame(n_blocks = length(idx), K = K, p_permutation = (1 + sum(null_K >= K)) / (B + 1))
+}
+strat_cs_res <- strat_cs(an$reject, an$stakes, blk)
+knitr::kable(strat_cs_res, digits = 4)
+```
+
+```{r c2-strat-sens, cache=TRUE, dependson="c2-strat-params"}
+# Sensitivity of the stratified test to the block definition (robustness check, not reported in the thesis)
+settings <- expand.grid(blocks = c("paper", paste0("q", 2:8)),
+                        by_wealth = c(FALSE, TRUE), stringsAsFactors = FALSE)
+sens <- bind_rows(lapply(seq_len(nrow(settings)), function(i) {
+  st <- settings[i, ]
+  b <- make_blocks(an, paper = st$blocks == "paper",
+                   q = if (st$blocks == "paper") NA else as.integer(sub("q", "", st$blocks)),
+                   by_wealth = st$by_wealth)
+  cbind(st, strat_jt(an$reject, an$stakes, b, B = B_sens))
+}))
+knitr::kable(sens, digits = 4)
+```
+
+Within every offer band, rejection falls from Rs 2,000 to Rs 20,000, and the Rs 20/Rs 200 inversion persists in the lowest band and the 20–30% band. Once responders are compared only with others who received similar offers, the Jonckheere test becomes much stronger: p ≈ 0.001 with the paper's offer bands, compared with p = 0.013 without conditioning. The stratified Chacko–Shorack test yields p = 0.0008, about as strong as the stratified Jonckheere test. The blocks are deliberately not split further by wealth, as the cells would become too small, and the offer bands of the paper are used directly instead of data-driven quantiles.
+
+The logit model is stronger still: the joint likelihood-ratio test of the three stakes dummies gives p < 0.0001. It uses the exact offer share instead of four coarse bands, but it also assumes that the log-odds of rejection are linear in the offer share. That both approaches reject clearly shows that the stakes effect is not an artefact of the logit specification.
+
+#### Summary of RH2
+
+```{r c2-summary}
+summary_tab <- bind_rows(
+  res_pooled %>% mutate(group = "Pooled"),
+  res_wealth %>% select(-fisher) %>% mutate(group = sub(" \\(.*", "", group))) %>%
+  select(group, test, p_permutation) %>%
+  pivot_wider(names_from = group, values_from = p_permutation) %>%
+  bind_rows(data.frame(test = "Fisher's exact (paper)",
+                       Pooled = fisher_chi(an)["fisher"],
+                       `No wealth` = fisher_chi(filter(an, wealth == 0))["fisher"],
+                       Wealth = fisher_chi(filter(an, wealth == 1))["fisher"],
+                       check.names = FALSE), .)
+knitr::kable(summary_tab, digits = 4, row.names = FALSE)
+```
+
+## Interpretation
+
+The original conclusions of Andersen et al. (2011) are robust. Offer shares fall with the stakes, rejection rates fall with the stakes, and the stakes effect on rejection persists when responders are compared only with others who received similar offers. No parametric or rank-based procedure contradicts these results. The comparison nevertheless yields four insights about test choice.
+
+- **For the offers (RH1), the $t$-tests are valid but inefficient.** The offers lie on a few focal points and have a long right tail, so the mean is a noisy summary. The Wilcoxon test supports the authors' claim that offer shares decline with the second tenfold increase in stakes, which their own $t$-test does not. The Jonckheere test answers RH1 with a single test and needs only a fraction of the published sample.
+- **With focal points, the power curves of the rank tests reflect the shift model.** Shifting the stake groups breaks the ties between identical offers, so the rejection rates of the rank tests jump instead of rising with the size of the effect.
+- **For the responses (RH2), the binary outcome moves the question from the method to the structure.** The Wilcoxon test coincides with the authors' $z$-test, so what matters is whether a test respects the predicted direction and order. Fisher's test does not. The Jonckheere test is the most powerful when the order holds and loses all power when it is violated. The Chacko–Shorack test is close to the best test in every pattern and is therefore the most robust choice, although not uniformly better.
+- **Conditioning on the offer is essential for RH2.** Because offers fall with the stakes, the unconditional comparison masks part of the stakes effect. The logit with the exact offer share is stronger than the stratified rank tests, which compare responders only within four offer bands, and the agreement of both shows that the effect is not an artefact of the logit specification.
+
+Overall, the case shows that the advantage of rank-based tests does not lie in replacing a parametric test one-to-one. It lies in choosing a test whose alternative matches the hypothesis: an ordered test for an ordered hypothesis, and a test that tolerates violations of the ordering where they are possible.

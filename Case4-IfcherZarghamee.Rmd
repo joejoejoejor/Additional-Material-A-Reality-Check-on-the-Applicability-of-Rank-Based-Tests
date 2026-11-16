@@ -1,0 +1,509 @@
+---
+title: "Case 4: Ifcher & Zarghamee (2011)"
+subtitle: "Positive affect and time preference"
+author: "Johannes Valentin Solibieda"
+date: "November 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Figures used in the thesis: the chunk option fig.process = thesis_fig("caseN-name")
+# (together with dpi = 300, fig.retina = 1) copies the chunk's figure to ../Thesis/figures.
+thesis_fig <- function(name) function(path) {
+  file.copy(path, file.path("../Thesis/figures", paste0(name, ".png")), overwrite = TRUE)
+  path
+}
+```
+
+**Study:** Ifcher, J. and Zarghamee, H. (2011). Happiness and Time Preference: The Effect of Positive Affect in a Random-Assignment Experiment. *American Economic Review* 101(7): 3109–3129. <https://doi.org/10.1257/aer.101.7.3109>
+
+**Data:** `Ifcher & Zarghamee 2011/Dataset_AER_MS_-20090823.dta` (original data of the authors).
+
+This file reproduces all results, tables and figures of Case 4 (Section 4.4 of the thesis). It is self-contained: it reads the original data and defines every helper it uses. The sections follow the subsections of the case in the thesis.
+
+## Original study and research hypothesis
+
+Ifcher and Zarghamee (2011) study whether positive affect changes time preference. Subjects are randomly assigned to watch either a positive-affect film clip (treatment) or a neutral nature film (control). They then answer 30 time-preference questions: "Which amount $p$ today is worth as much to you as $m$ in $t$ days?", for 5 future values $m$ and 6 delays $t$. The design rules out differences in transaction costs between payments today and later. Patience is measured by the discount factor $D(m,t) = p/m$: a higher present value $p$ for the same $m$ and $t$ means more patience.
+
+> **RH1:** Positive affect increases patience, i.e. treated subjects state higher present values $p$ (a higher discount factor) than control subjects.
+
+The authors' main test is Table 3: an OLS regression of $p$ on the treatment dummy (not interacted with $m$ or $t$), fully saturated dummies for $m$, $t$ and $m \times t$, and, in some columns, demographic controls and self-reported happiness, with standard errors clustered by subject. Columns 5–8 exclude answers with $p = m$. Table 2D additionally reports a t-test of the discount factor over all answers.
+
+```{r c4-setup, message=FALSE, warning=FALSE}
+library(haven); library(dplyr); library(tidyr); library(ggplot2); library(patchwork)
+library(lmtest); library(sandwich)
+
+iz2 <- read_dta("Ifcher & Zarghamee 2011/Dataset_AER_MS_-20090823.dta") %>%
+  filter(!is.na(pv)) %>%                                    # 5 unintelligible answers, as in the paper
+  mutate(dmt = pv / fv,
+         female = as.integer(gender == 1),
+         practicing = as.integer(practice_religion == 1),
+         group = factor(treatment, levels = c(0, 1), labels = c("Neutral", "Positive")))
+ctrl_demo2 <- "+ factor(college) + female + factor(race) + factor(religion) + practicing + factor(family_income)"
+
+c(subjects = n_distinct(iz2$id), answers = nrow(iz2))
+table(iz2$group[!duplicated(iz2$id)])
+```
+
+## Data diagnostics and fit of the original analysis
+
+```{r c4-diag}
+# answers per subject, mass at p = m, subjects who never discount
+table(tapply(iz2$pv, iz2$id, length))
+c(share_p_equals_m = mean(iz2$pv >= iz2$fv))
+tapply(iz2$pv >= iz2$fv, iz2$group, mean)
+subj2 <- iz2 %>% group_by(id, group, treatment) %>%
+  summarise(mean_dmt = mean(dmt), never_discounts = all(pv >= fv), .groups = "drop")
+table(subj2$group, subj2$never_discounts)
+
+# dependence of a subject's answers: share of variance between subjects (ICC)
+a <- anova(lm(dmt ~ factor(fv) * factor(delay) + factor(id), data = iz2))
+k <- 30
+c(ICC = (a["factor(id)", "Mean Sq"] - a["Residuals", "Mean Sq"]) /
+        (a["factor(id)", "Mean Sq"] + (k - 1) * a["Residuals", "Mean Sq"]))
+
+# scale of p by future value
+iz2 %>% group_by(fv) %>% summarise(mean_p = mean(pv), sd_p = sd(pv), .groups = "drop")
+
+# subject-level distribution
+shapiro.test(subj2$mean_dmt)
+```
+
+```{r c4-fig-target, fig.width=10, fig.height=4, dpi=300, fig.retina=1, fig.process=thesis_fig("case4-target")}
+# Target variable p for three (m, t) combinations, by group; dashed line: p = m (no discounting)
+combos <- data.frame(fv_r = c(11.34, 24.28, 51.71), delay = c(1, 14, 56))
+iz2 %>% mutate(fv_r = round(fv, 2)) %>%
+  inner_join(combos, by = c("fv_r", "delay")) %>%
+  mutate(cell = factor(sprintf("m = $%.2f, t = %d %s", fv_r, delay, ifelse(delay == 1, "day", "days")),
+                       levels = sprintf("m = $%.2f, t = %d %s", combos$fv_r, combos$delay,
+                                        ifelse(combos$delay == 1, "day", "days")))) %>%
+  ggplot(aes(group, pv, fill = group)) +
+  geom_hline(aes(yintercept = fv_r), linetype = "dashed", colour = "gray40") +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA, width = 0.6) +
+  geom_jitter(width = 0.12, height = 0, size = 1, alpha = 0.5) +
+  facet_wrap(~ cell, scales = "free_y") +
+  labs(x = NULL, y = "Present value p ($)",
+       caption = "Dashed line: p = m (no discounting); points: individual answers.") +
+  theme_minimal(base_size = 11) + theme(legend.position = "none")
+```
+
+```{r c4-fig, fig.width=10, fig.height=4, dpi=300, fig.retina=1, fig.process=thesis_fig("case4-discount")}
+p_curve <- iz2 %>% group_by(group, fv, delay) %>% summarise(dmt = mean(dmt), .groups = "drop") %>%
+  ggplot(aes(delay, dmt, colour = group)) +
+  geom_line() + geom_point(size = 1.4) +
+  facet_wrap(~ round(fv, 2), nrow = 1) +
+  labs(x = "Delay t (days)", y = "Mean discount factor p/m", colour = NULL) +
+  theme_minimal(base_size = 10) + theme(legend.position = "bottom")
+
+p_subj <- ggplot(subj2, aes(mean_dmt, fill = group)) +
+  geom_histogram(binwidth = 0.05, boundary = 0, colour = "white", alpha = 0.85) +
+  facet_wrap(~ group, ncol = 1) +
+  labs(x = "Mean discount factor per subject", y = "Subjects") +
+  theme_minimal(base_size = 10) + theme(legend.position = "none")
+
+p_curve + p_subj + plot_layout(widths = c(2.3, 1))
+```
+
+```{r c4-fig-ties, fig.width=9, fig.height=3.5, dpi=300, fig.retina=1, fig.process=thesis_fig("case4-ties")}
+# Ties: how often each present value is given in one cell (m = $24.28, t = 14 days)
+iz2 %>% filter(round(fv, 2) == 24.28, delay == 14) %>%
+  mutate(p_lab = factor(round(pv, 2))) %>%
+  count(group, p_lab) %>%
+  ggplot(aes(p_lab, n, fill = group)) +
+  geom_col(position = position_dodge(preserve = "single"), width = 0.8) +
+  labs(x = "Present value p ($) stated for $24.28 in 14 days", y = "Number of subjects", fill = NULL) +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+```
+
+**Findings.** Every subject answers 30 closely related questions, so the subject is the independent unit, and the answers of a subject are strongly dependent (ICC above). The present values scale with $m$, so answers to large-$m$ questions carry more weight in a regression on $p$. The outcome is bounded by $p \leq m$, and 29% of all answers lie exactly at this bound (no discounting); 11 subjects never discount at all. Subjects mostly state round amounts: in the question shown in the last figure ($m = \$24.28$, $t = 14$ days), the 69 answers take only 14 different values. At the subject level, the mean discount factor is strongly left-skewed, and the control group has a tail of very impatient subjects (mean discount factors between 0.2 and 0.5), whereas no treated subject lies below 0.6. A difference in means is therefore partly driven by a few control subjects with large deviations.
+
+The authors' regression tests the null hypothesis that treated and control subjects state the same mean present value $p$ for a given combination of $m$ and $t$, with one common treatment effect across all 30 questions. It accounts for the dependence of a subject's answers by clustering by subject, which is valid with 69 clusters.
+
+## Test choice and justification
+
+The treatment was assigned to subjects, and each subject answers all 30 questions, so the **subject** is the independent unit. The rank-based counterpart to Table 3 therefore has to produce one value per subject:
+
+1. **Within-cell ranks.** $p$ is ranked within each $(m, t)$ cell across all subjects (scaled by the cell size). This removes the scale problem that \$51.71 produces different present values than \$11.34, and it makes the 30 questions comparable.
+2. **Aggregation per subject.** The ranks are averaged for each subject, giving one value per subject.
+3. **Wilcoxon rank-sum test** on these 34 treatment and 35 control values, with the Hodges–Lehmann shift as effect size.
+
+This is the van Elteren test (stratified Wilcoxon rank-sum test; Section 3.4 of the thesis) with the $(m,t)$ cells as blocks, made valid for this design. The standard van Elteren test combines the within-block Wilcoxon statistics with a variance that assumes independent blocks. Here, the same 69 subjects appear in every block, so that variance is far too small. Aggregating to one value per subject accounts for this dependence.
+
+Because $m$ and $t$ vary within subjects, they are balanced between treatment and control by design; the $m \times t$ dummies in the regression only add precision. As a counterpart to the columns with controls, the test is also applied to subject-level means of residuals from a regression of $p$ on demographics and happiness, and on the $m \times t$ dummies plus demographics and happiness (column 4), estimated *without* the treatment dummy. Answers with $p = m$ need not be excluded as in columns 5–8: rank tests handle the resulting ties, and excluding them selects observations on the outcome.
+
+## Results
+
+### Replication of the original analysis
+
+```{r c4-replication}
+# Table 2D: t-test of the discount factor over all answers (Stata ttest, pooled variance)
+t2d <- t.test(dmt ~ treatment, data = iz2, var.equal = TRUE)
+t2d$p.value
+
+# Table 3
+specs2 <- list(
+  "(1)" = "pv ~ treatment + factor(fv) * factor(delay)",
+  "(2)" = paste("pv ~ treatment + factor(fv) * factor(delay)", ctrl_demo2),
+  "(3)" = "pv ~ treatment + factor(fv) * factor(delay) + factor(happiness)",
+  "(4)" = paste("pv ~ treatment + factor(fv) * factor(delay)", ctrl_demo2, "+ factor(happiness)"))
+t3_2 <- bind_rows(lapply(c(FALSE, TRUE), function(restrict) bind_rows(lapply(names(specs2), function(nm) {
+  dd <- if (restrict) filter(iz2, pv < fv) else iz2
+  m  <- lm(as.formula(specs2[[nm]]), data = dd)
+  G  <- n_distinct(dd$id[as.integer(rownames(model.frame(m)))])
+  ct <- coeftest(m, vcov = vcovCL(m, cluster = ~ id, type = "HC1"), df = G - 1)["treatment", ]  # Stata: t with G-1 df
+  data.frame(column = if (restrict) paste0("(", as.integer(substr(nm, 2, 2)) + 4, ")") else nm,
+             sample = if (restrict) "p < m" else "all", estimate = ct[1], se = ct[2], p = ct[4],
+             clusters = G)
+}))))
+knitr::kable(t3_2, digits = 3, row.names = FALSE)
+```
+
+All eight columns of Table 3 reproduce exactly. Without controls (column 1), the treatment effect is significant only at the 10% level (p = 0.054); it becomes significant at the 5% level with controls or after excluding the answers with $p = m$.
+
+### Rank-based tests
+
+```{r c4-rank-tests, cache=TRUE}
+# (1) within-cell ranks, mean per subject, Wilcoxon
+cell_r <- iz2 %>% group_by(fv, delay) %>% mutate(r = rank(pv) / n()) %>% ungroup()
+s_rank <- cell_r %>% group_by(id, treatment) %>% summarise(mean_rank = mean(r), .groups = "drop")
+w_rank <- wilcox.test(mean_rank ~ treatment, data = s_rank, exact = FALSE, conf.int = TRUE)
+
+# (2) naive van Elteren test: 30 cells as independent blocks, weights 1/(N_k + 1)
+cells <- split(iz2, list(iz2$fv, iz2$delay), drop = TRUE)
+lab <- tapply(iz2$treatment, iz2$id, function(x) x[1])
+combo <- function(lab) {
+  T <- 0; E <- 0; V <- 0
+  for (d in cells) {
+    tr <- lab[as.character(d$id)]; r <- rank(d$pv); N <- nrow(d); n1 <- sum(tr); ck <- 1 / (N + 1)
+    tt <- table(d$pv)
+    T <- T + ck * sum(r[tr == 1]); E <- E + ck * n1 * (N + 1) / 2
+    V <- V + ck^2 * n1 * (N - n1) / 12 * ((N + 1) - sum(tt^3 - tt) / (N * (N - 1)))
+  }
+  c(T = T, E = E, V = V)
+}
+cb <- combo(lab)
+p_naive <- 2 * pnorm(-abs((cb["T"] - cb["E"]) / sqrt(cb["V"])))
+
+# (4) residual versions (controls removed without the treatment dummy), in dollars
+resid_w <- function(formula) {
+  m <- lm(formula, data = iz2, na.action = na.exclude)
+  s <- iz2 %>% mutate(res = residuals(m)) %>% filter(!is.na(res)) %>%
+    group_by(id, treatment) %>% summarise(r = mean(res), .groups = "drop")
+  w <- wilcox.test(r ~ treatment, data = s, exact = FALSE, conf.int = TRUE)
+  c(n = nrow(s), HL = -unname(w$estimate), lo = -w$conf.int[2], hi = -w$conf.int[1], p = w$p.value)
+}
+r_a <- resid_w(as.formula(paste("pv ~ 1", ctrl_demo2, "+ factor(happiness)")))
+r_b <- resid_w(as.formula(paste("pv ~ factor(fv) * factor(delay)", ctrl_demo2, "+ factor(happiness)")))
+
+data.frame(
+  test = c("van Elteren test, naive (cells as independent blocks)",
+           "Wilcoxon on mean within-cell ranks per subject",
+           "Wilcoxon on mean residuals per subject: demographics + happiness",
+           "Wilcoxon on mean residuals per subject: m x t FE + demographics + happiness (col. 4)"),
+  units = c(nrow(iz2), 69, r_a["n"], r_b["n"]),
+  p = c(p_naive, w_rank$p.value, r_a["p"], r_b["p"])) %>%
+  knitr::kable(digits = 4, row.names = FALSE)
+
+rbind("demographics + happiness" = r_a, "m x t FE + demographics + happiness" = r_b) %>% round(3)
+-unname(w_rank$estimate)   # HL shift in scaled within-cell ranks (Positive minus Neutral)
+```
+
+**Why the controls matter more for the rank test.** The controls explain a large share of the differences between subjects, mostly in the bulk of the distribution. This sharpens the ordering of the subjects by treatment, which is what the rank test uses, but changes little for the mean, which is driven by a few very impatient control subjects.
+
+```{r c4-fig-controls, fig.width=10, fig.height=6, dpi=300, fig.retina=1, fig.process=thesis_fig("case4-controls")}
+# Answers to three of the 30 questions, as observed and after removing the controls of col. 4
+# (demographics, happiness; estimated with m x t dummies and without the treatment dummy).
+# Adjusted answer = cell mean + residual, so both rows are in dollars of present value.
+m_c4 <- lm(as.formula(paste("pv ~ factor(fv) * factor(delay)", ctrl_demo2, "+ factor(happiness)")),
+           data = iz2, na.action = na.exclude)
+combos <- data.frame(fv_r = c(11.34, 24.28, 51.71), delay = c(1, 14, 56))
+cell_lab <- function(fv, d) sprintf("m = $%.2f, t = %d %s", fv, d, ifelse(d == 1, "day", "days"))
+dc <- iz2 %>% mutate(res = residuals(m_c4)) %>% filter(!is.na(res)) %>%
+  group_by(fv, delay) %>% mutate(adj = mean(pv) + res) %>% ungroup() %>%
+  mutate(fv_r = round(fv, 2)) %>% inner_join(combos, by = c("fv_r", "delay")) %>%
+  mutate(cell = factor(cell_lab(fv_r, delay), cell_lab(combos$fv_r, combos$delay)))
+pw <- dc %>% group_by(cell) %>%
+  summarise(raw = wilcox.test(pv ~ group, exact = FALSE)$p.value,
+            adj = wilcox.test(adj ~ group, exact = FALSE)$p.value, .groups = "drop")
+pw
+dc %>% tidyr::pivot_longer(c(pv, adj), names_to = "version", values_to = "value") %>%
+  mutate(version = factor(version, c("pv", "adj"), c("Observed answers", "Controls removed"))) %>%
+  left_join(tidyr::pivot_longer(pw, c(raw, adj), names_to = "v", values_to = "p") %>%
+              mutate(version = factor(v, c("raw", "adj"), c("Observed answers", "Controls removed"))) %>%
+              select(-v), by = c("cell", "version")) %>%
+  ggplot(aes(group, value, colour = group)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5, colour = "gray40") +
+  geom_jitter(width = 0.12, height = 0, size = 1.3, alpha = 0.6) +
+  geom_text(data = function(d) distinct(d, cell, version, p),
+            aes(x = 1.5, y = Inf, label = sprintf("Wilcoxon p = %.3f", p)),
+            inherit.aes = FALSE, vjust = 1.3, size = 3.3) +
+  facet_wrap(version ~ cell, nrow = 2, scales = "free_y") +   # own y-axis per question
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) +
+  labs(x = NULL, y = "Present value p ($)") +
+  theme_minimal(base_size = 11) + theme(legend.position = "none")
+```
+
+The standard van Elteren test, which treats the 30 cells as independent blocks, gives $p < 10^{-7}$, a result of counting answers instead of subjects. The Wilcoxon test on the mean within-cell ranks per subject ($p = 0.16$) points in the predicted direction but is not significant. With demographics and happiness as controls, the rank test on residuals gives $p = 0.060$, and $p = 0.045$ when the $m \times t$ dummies are added (cf. column 4, $p = 0.019$); the $m \times t$ dummies change little, because they average out within each subject in the balanced design. With the same controls, the Hodges–Lehmann shift (\$1.33) is only about half the OLS coefficient of column 4 (\$2.42): the regression effect is driven to a large extent by a tail of very impatient control subjects (mean discount factor 0.2–0.5), while no treated subject lies below 0.6.
+
+### Brunner–Munzel check
+
+The Wilcoxon test is exact only when both groups have the same distribution. The Brunner–Munzel test drops this assumption (Brunner and Munzel 2000); its p-value is obtained from a studentised permutation test (Neubert and Brunner 2007). The thesis states in a footnote (Section 4.5) that the test was applied in all cases and did not change any conclusion; this section documents the check for Case 4.
+
+```{r c4-bm, cache=TRUE}
+# Brunner-Munzel statistic for the relative effect p = P(a < b) + 0.5 P(a = b)
+bm <- function(a, b) {
+  na <- length(a); nb <- length(b); N <- na + nb
+  r  <- rank(c(a, b)); ra <- r[seq_len(na)]; rb <- r[-seq_len(na)]
+  ma <- mean(ra); mb <- mean(rb)
+  sa <- sum((ra - rank(a) - ma + (na + 1) / 2)^2) / (na - 1)
+  sb <- sum((rb - rank(b) - mb + (nb + 1) / 2)^2) / (nb - 1)
+  V  <- na * sa + nb * sb
+  list(W    = if (V == 0) sign(mb - ma) * Inf else na * nb * (mb - ma) / (N * sqrt(V)),
+       df   = if (V == 0) NA_real_ else V^2 / ((na * sa)^2 / (na - 1) + (nb * sb)^2 / (nb - 1)),
+       phat = (mb - (nb + 1) / 2) / na)
+}
+# Two-sided studentised permutation p-value and t-approximation
+bm_test <- function(a, b, B = 1e4, seed = 1) {
+  s <- bm(a, b); v <- c(a, b); na <- length(a)
+  set.seed(seed)
+  W_perm <- replicate(B, { i <- sample.int(length(v), na); bm(v[i], v[-i])$W })
+  c(phat = s$phat,
+    p_bm_permutation = (1 + sum(abs(W_perm) >= abs(s$W) - 1e-10)) / (B + 1),
+    p_bm_t = if (is.finite(s$W)) 2 * pt(-abs(s$W), s$df) else NA)
+}
+
+# subject-level residual means for the two specifications with controls
+resid_means <- function(formula) {
+  m <- lm(formula, data = iz2, na.action = na.exclude)
+  iz2 %>% mutate(res = residuals(m)) %>% filter(!is.na(res)) %>%
+    group_by(id, treatment) %>% summarise(r = mean(res), .groups = "drop")
+}
+ra <- resid_means(as.formula(paste("pv ~ 1", ctrl_demo2, "+ factor(happiness)")))
+rb <- resid_means(as.formula(paste("pv ~ factor(fv) * factor(delay)", ctrl_demo2, "+ factor(happiness)")))
+
+rbind(
+  "Mean within-cell rank per subject" =
+    c(p_wilcoxon = w_rank$p.value, bm_test(s_rank$mean_rank[s_rank$treatment == 0], s_rank$mean_rank[s_rank$treatment == 1])),
+  "Mean residual: demographics + happiness" =
+    c(p_wilcoxon = unname(r_a["p"]), bm_test(ra$r[ra$treatment == 0], ra$r[ra$treatment == 1])),
+  "Mean residual: m x t FE + demographics + happiness" =
+    c(p_wilcoxon = unname(r_b["p"]), bm_test(rb$r[rb$treatment == 0], rb$r[rb$treatment == 1]))) %>%
+  knitr::kable(digits = 4)
+```
+
+The Brunner–Munzel test gives practically the same p-values as the Wilcoxon test and does not change any conclusion.
+
+### Resampling simulations
+
+The simulation follows Section 3.5 of the thesis with the **subject** as the unit: every simulated data set consists of whole subjects with all their answers, so the dependence within subjects is preserved. Compared are the authors' OLS of column 1 ($m \times t$ fixed effects, standard errors clustered by subject, $t$-distribution with $G-1$ degrees of freedom) and the Wilcoxon test on the mean within-cell ranks per subject. For the size, the standard van Elteren test (cells as independent blocks) is included as well.
+
+**Size under the pooled null hypothesis.** 69 subjects are drawn with replacement from all 69 subjects and randomly split into 34 treated and 35 control subjects.
+
+**Closing the gap (main data-generating process).** The effect is measured on the discount factor $D = p/m$, so that it scales with $m$. Since the answers are bounded by $p \leq m$ and 29% of them lie exactly at this bound, the treatment is modelled as closing a share of the gap to the full amount, $p' = p + \delta (m - p)$, i.e. it scales the gap $1 - D$. The observed effect is the ratio $\hat r$ of the mean (or median) gaps of treated and control subjects, and treated answers are set to $D(s) = 1 - (1 - D)\,\hat r^{\,s - 1}$. At $s = 1$ the data is unchanged, at $s = 0$ the treated gaps are as large as the control gaps, and answers with $D = 1$ always stay at 1, so the many ties at the upper bound are preserved. This is a shift on the scale $\log(1 - D)$ and is one of the alternative data-generating processes of Section 3.5.
+
+**Additive shift (comparison, reported in the appendix of the thesis).** As in the other cases, every answer of a treated subject is shifted by $-\hat\theta + s\hat\theta$, capped to $[0, 1]$ and transformed back to $p = D \cdot m$, with $\hat\theta = \bar D_T - \bar D_C$ (mean centring) or the Hodges–Lehmann shift of the subject means $\bar D_i$ (HL centring). The realised effect is recorded.
+
+**Sample size.** At the observed effect (resampling from the original groups), both groups are scaled by a common factor $\lambda$, so that the ratio 34/35 is kept. The required sample size is reported as the total number of subjects.
+
+```{r c4-sim-params, cache=TRUE}
+# ---- Parameters (change here) ---------------------------------------------
+s_grid_i   <- seq(0, 1.5, by = 0.05)
+N_grid_i   <- c(20, 30, 40, 50, 60, 70, 90, 120, 160, 200, 260)   # total subjects; lambda = N / 69
+B_size_i   <- 5000
+B_i        <- 1000
+alpha_i    <- 0.05
+```
+
+```{r c4-sim-helpers}
+cells_i <- iz2 %>% distinct(fv, delay) %>% arrange(fv, delay) %>% mutate(cell = row_number())
+iz2c <- iz2 %>% left_join(cells_i, by = c("fv", "delay"))
+ids_i <- sort(unique(iz2c$id)); m_i <- cells_i$fv
+D_obs <- matrix(NA, length(ids_i), nrow(cells_i))           # subjects x 30 cells, discount factors
+D_obs[cbind(match(iz2c$id, ids_i), iz2c$cell)] <- iz2c$dmt
+tr_obs <- iz2c$treatment[match(ids_i, iz2c$id)]
+
+# OLS with cell fixed effects via Frisch-Waugh (demeaning within cells), CR1 SE clustered by subject
+ols_c1 <- function(P, tr) {
+  ok <- !is.na(P); X <- matrix(tr, nrow(P), ncol(P))
+  y0 <- P; y0[!ok] <- 0; x0 <- X; x0[!ok] <- 0
+  yd <- sweep(P, 2, colSums(y0) / colSums(ok)); xd <- sweep(X, 2, colSums(x0) / colSums(ok))
+  yd[!ok] <- 0; xd[!ok] <- 0
+  b <- sum(xd * yd) / sum(xd^2); e <- yd - b * xd
+  sc <- rowSums(xd * e); G <- nrow(P); N <- sum(ok); K <- 31
+  se <- sqrt(G / (G - 1) * (N - 1) / (N - K) * sum(sc^2) / sum(xd^2)^2)
+  2 * pt(-abs(b / se), G - 1)
+}
+# Wilcoxon on mean within-cell ranks per subject
+wil_rank_i <- function(P, tr) {
+  R <- apply(P, 2, function(v) rank(v, na.last = "keep") / sum(!is.na(v)))
+  mr <- rowMeans(R, na.rm = TRUE)
+  suppressWarnings(wilcox.test(mr[tr == 1], mr[tr == 0], exact = FALSE)$p.value)
+}
+# standard van Elteren test: cells as independent blocks
+combo_naive <- function(P, tr) {
+  T <- E <- V <- 0
+  for (j in seq_len(ncol(P))) {
+    v <- P[, j]; ok <- !is.na(v); v <- v[ok]; t1 <- tr[ok]
+    N <- length(v); n1 <- sum(t1); ck <- 1 / (N + 1); r <- rank(v); tt <- table(v)
+    T <- T + ck * sum(r[t1 == 1]); E <- E + ck * n1 * (N + 1) / 2
+    V <- V + ck^2 * n1 * (N - n1) / 12 * ((N + 1) - sum(tt^3 - tt) / (N * (N - 1)))
+  }
+  2 * pnorm(-abs((T - E) / sqrt(V)))
+}
+c(ols = ols_c1(sweep(D_obs, 2, m_i, "*"), tr_obs), wilcoxon = wil_rank_i(sweep(D_obs, 2, m_i, "*"), tr_obs))  # check
+
+subj_mean <- rowMeans(D_obs, na.rm = TRUE)
+theta_i <- c(mean = mean(subj_mean[tr_obs == 1]) - mean(subj_mean[tr_obs == 0]),
+             hl   = median(outer(subj_mean[tr_obs == 1], subj_mean[tr_obs == 0], "-")))
+theta_i
+
+# gap DGP: ratio of the gaps to the full amount (1 - D), treated / control
+gap_T <- 1 - subj_mean[tr_obs == 1]; gap_C <- 1 - subj_mean[tr_obs == 0]
+ratio_i <- c(mean = mean(gap_T) / mean(gap_C), median = median(gap_T) / median(gap_C))
+ratio_i
+
+idx_T <- which(tr_obs == 1); idx_C <- which(tr_obs == 0)
+sim_i <- function(s, center = "mean", nT = length(idx_T), nC = length(idx_C), dgp = "additive") {
+  iT <- idx_T[sample.int(length(idx_T), nT, TRUE)]; iC <- idx_C[sample.int(length(idx_C), nC, TRUE)]
+  DT <- D_obs[iT, , drop = FALSE]
+  DT <- if (dgp == "additive") pmin(pmax(DT - (1 - s) * theta_i[center], 0), 1) else
+        pmax(1 - (1 - DT) * ratio_i[center]^(s - 1), 0)   # gap DGP: D = 1 stays 1
+  D  <- rbind(DT, D_obs[iC, , drop = FALSE]); tr <- c(rep(1, nT), rep(0, nC))
+  sm <- rowMeans(D, na.rm = TRUE)
+  real    <- mean(sm[tr == 1]) - mean(sm[tr == 0])
+  real_hl <- median(outer(sm[tr == 1], sm[tr == 0], "-"))   # realised HL shift (measure of the HL centring)
+  P <- sweep(D, 2, m_i, "*")
+  c(ols = ols_c1(P, tr), wilcox = wil_rank_i(P, tr), s_real = real / theta_i[["mean"]],
+    s_real_hl = real_hl / theta_i[["hl"]])
+}
+lab_i <- c(ols = "OLS, column 1 (paper)", wilcox = "Wilcoxon, mean within-cell rank")
+```
+
+**Size under the pooled null hypothesis.**
+
+```{r c4-sim-size, cache=TRUE, dependson="c4-sim-params"}
+set.seed(41)
+r0_i <- t(replicate(B_size_i, {
+  b <- sample.int(length(ids_i), length(ids_i), TRUE)
+  tr <- sample(c(rep(1, length(idx_T)), rep(0, length(idx_C))))
+  P <- sweep(D_obs[b, ], 2, m_i, "*")
+  c(ols = ols_c1(P, tr), wilcox = wil_rank_i(P, tr), combo_naive = combo_naive(P, tr))
+}))
+data.frame(test = c(lab_i, combo_naive = "van Elteren test, cells as independent blocks"),
+           size = colMeans(r0_i < alpha_i),
+           mc_se = sqrt(colMeans(r0_i < alpha_i) * (1 - colMeans(r0_i < alpha_i)) / B_size_i)) %>%
+  knitr::kable(digits = 4, row.names = FALSE)
+```
+
+**Power curves.**
+
+```{r c4-sim-curves, cache=TRUE, dependson="c4-sim-params"}
+dgp_specs <- list(c(dgp = "additive", center = "mean"), c(dgp = "additive", center = "hl"),
+                  c(dgp = "gap", center = "mean"), c(dgp = "gap", center = "median"))
+curves_i <- bind_rows(lapply(dgp_specs, function(sp) {
+  set.seed(42)
+  bind_rows(lapply(s_grid_i, function(sv) {
+    r <- t(replicate(B_i, sim_i(sv, center = sp[["center"]], dgp = sp[["dgp"]])))
+    data.frame(dgp = sp[["dgp"]], center = sp[["center"]], s = sv, s_real = mean(r[, "s_real"]),
+               s_real_hl = mean(r[, "s_real_hl"]),
+               test = unname(lab_i), power = colMeans(r[, c("ols", "wilcox")] < alpha_i), n_sim = B_i)
+  }))
+})) %>%
+  mutate(variant = factor(paste(dgp, center),
+                          c("additive mean", "additive hl", "gap mean", "gap median"),
+                          c("Additive shift, mean", "Additive shift, HL",
+                            "Closing the gap, mean ratio", "Closing the gap, median ratio")),
+         test = factor(test, lab_i), se = sqrt(power * (1 - power) / n_sim))
+
+curves_i %>% filter(s %in% c(0, 0.5, 1, 1.5)) %>% select(variant, s, s_real, test, power) %>%
+  pivot_wider(names_from = test, values_from = power) %>% knitr::kable(digits = 3)
+```
+
+```{r c4-fig-sim-curves, fig.width=10, fig.height=11}
+curves_i %>% pivot_longer(c(s, s_real), names_to = "axis", values_to = "x") %>%
+  mutate(axis = factor(axis, c("s", "s_real"), c("Target effect s", "Realised effect (share of observed)"))) %>%
+  ggplot(aes(x, power, colour = test)) +
+  geom_hline(yintercept = alpha_i, linetype = "dashed", colour = "gray50") +
+  geom_errorbar(aes(ymin = power - 1.96 * se, ymax = power + 1.96 * se), width = 0, alpha = 0.4) +
+  geom_line(linewidth = 0.9) + geom_point(size = 1.2) +
+  facet_grid(variant ~ axis) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Strength of the effect (1 = observed)", y = "Rejection rate at α = 0.05", colour = NULL) +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+```
+
+```{r c4-fig-sim-curves-thesis, fig.width=10, fig.height=9, dpi=300, fig.retina=1, fig.process=thesis_fig("case4-power-full")}
+# compact version for the thesis (appendix): additive shift with mean and HL centring, gap DGP with mean ratio
+curves_i %>% filter(variant %in% c("Additive shift, mean", "Additive shift, HL", "Closing the gap, mean ratio")) %>% mutate(variant = droplevels(variant)) %>%
+  # realised effect in the measure of the centring: HL shift for HL centring, mean difference otherwise
+  mutate(s_real = ifelse(variant == "Additive shift, HL", s_real_hl, s_real)) %>%
+  pivot_longer(c(s, s_real), names_to = "axis", values_to = "x") %>%
+  mutate(axis = factor(axis, c("s", "s_real"), c("Target effect s", "Realised effect (share of observed)"))) %>%
+  ggplot(aes(x, power, colour = test)) +
+  geom_hline(yintercept = alpha_i, linetype = "dashed", colour = "gray50") +
+  geom_errorbar(aes(ymin = power - 1.96 * se, ymax = power + 1.96 * se), width = 0, alpha = 0.4) +
+  geom_line(linewidth = 0.9) + geom_point(size = 1.2) +
+  facet_grid(variant ~ axis) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Strength of the effect (1 = observed)", y = "Rejection rate at α = 0.05", colour = NULL) +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+```
+
+```{r c4-fig-sim-curves-realised, fig.width=7, fig.height=4.5, dpi=300, fig.retina=1}
+# Thesis main text: gap DGP only, realised effect (all DGPs, target and realised: case4-power-full, appendix)
+curves_i %>% filter(variant == "Closing the gap, mean ratio") %>%
+  ggplot(aes(s_real, power, colour = test)) +
+  geom_hline(yintercept = alpha_i, linetype = "dashed", colour = "gray50") +
+  geom_errorbar(aes(ymin = power - 1.96 * se, ymax = power + 1.96 * se), width = 0, alpha = 0.4) +
+  geom_line(linewidth = 0.9) + geom_point(size = 1.2) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Realised effect (share of observed mean difference)", y = "Rejection rate at α = 0.05", colour = NULL) +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+```
+
+**Required number of subjects.**
+
+```{r c4-sim-sizing, cache=TRUE, dependson="c4-sim-params"}
+set.seed(43)
+sizing_i <- bind_rows(lapply(N_grid_i, function(N) {
+  lam <- N / length(tr_obs)                                   # common scaling factor
+  nT <- round(lam * length(idx_T)); nC <- round(lam * length(idx_C))
+  r <- t(replicate(B_i, sim_i(1, nT = nT, nC = nC)))
+  data.frame(lambda = lam, N_total = nT + nC, test = unname(lab_i), power = colMeans(r[, c("ols", "wilcox")] < alpha_i),
+             n_sim = B_i)
+})) %>% mutate(test = factor(test, lab_i), se = sqrt(power * (1 - power) / n_sim))
+
+n_for_i <- function(n, p, target) if (max(p) < target) NA_real_ else
+  if (min(p) >= target) min(n) else approx(p, n, xout = target, ties = "ordered")$y
+sizing_i %>% group_by(test) %>%
+  summarise(N_80 = n_for_i(N_total, power, 0.8), N_90 = n_for_i(N_total, power, 0.9),
+            .groups = "drop") %>% knitr::kable(digits = 0)
+```
+
+```{r c4-fig-sim-sizing, fig.width=8, fig.height=4.5, dpi=300, fig.retina=1}
+p_sizing_i <- ggplot(sizing_i, aes(N_total, power, colour = test)) +
+  geom_hline(yintercept = c(0.8, 0.9), linetype = "dashed", colour = "gray50") +
+  geom_vline(xintercept = length(tr_obs), linetype = "dotdash", colour = "gray30") +
+  geom_line(linewidth = 1) + geom_point(size = 1.8) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Total number of subjects", y = "Power at α = 0.05", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+p_sizing_i
+```
+
+**Interpretation of the simulation.** Under the pooled null hypothesis, the OLS (4.6%) and the Wilcoxon test on mean within-cell ranks (4.9%) hold their level, whereas the standard van Elteren test, which treats the 30 cells as independent blocks, rejects a true null hypothesis in 66% of the replications. When the treatment closes the gap to the full amount, both tests hold their level at $s = 0$, the OLS curve rises smoothly, but the Wilcoxon curve stays at 5–8% for all $s < 1$ and jumps to 25% at $s = 1$, the only point at which no answer is changed. As explained in Section 3.5 of the thesis, the shift breaks the ties at round amounts, so the curve of the rank test moves in steps; closing the gap protects only the ties at the bound $p = m$. 91% of the answers are tied with another answer in the same cell (on average only 13 distinct values per cell). The additive shift leads to larger distortions: with mean centring, the Wilcoxon test rejects in 44% of the replications at $s = 0$, and with HL centring still in 31%, because centring on the mean does not equalise the ranks when the groups differ in shape, and because shifting the answers also breaks the ties at $p = m$. The power at the observed effect and the sample-size simulation, which resample the observed answers without shifting them, are therefore used for the comparison. At the observed effect, the OLS rejects in 49% and the Wilcoxon test in 26–28% of the replications; the OLS needs about 140 subjects in total for 80% power and about 185 for 90%, whereas the Wilcoxon test does not reach 80% even with 260 subjects.
+
+## Interpretation
+
+All procedures point in the direction reported by Ifcher and Zarghamee (2011): subjects who watched the positive film state higher present values and thus discount the future less. The evidence for this effect, however, is weak. Without controls, it is not significant at the 5% level with any test that respects the subject as the independent unit, neither with the authors' regression (p = 0.054) nor with the rank test (p = 0.16). It becomes significant only once demographic controls and self-reported happiness are added, or once all answers at $p = m$ are excluded, and even then only narrowly. With 69 subjects, the experiment was too small to detect an effect of the observed size reliably. The comparison yields four insights.
+
+- **The subject is the unit that determines what the data can show.** Each subject answers 30 closely related questions, so the answers contain far less independent information than their number suggests. Ranking within each question and averaging per subject yields one value per subject, and the rank test is then valid without modelling how the answers of a subject are related. Counting answers instead of subjects, as the standard van Elteren test does, rejects a true null hypothesis in two thirds of the replications.
+- **The effect sizes show where the treatment effect comes from.** The Hodges–Lehmann shift is only about half the OLS coefficient, because the difference in means rests largely on a group of very impatient control subjects. Whether positive affect makes everyone a little more patient or mainly prevents very impatient answers is a question that the mean difference alone does not answer.
+- **Here the rank test is less powerful than the regression.** Subjects answer in round amounts, so many answers share a rank, and the effect lies in the tail that the mean captures and the ranks down-weight. The authors' regression is valid, and their choice is defensible. The rank-based analysis is still useful as a complement, because it shows how much of the effect rests on a few subjects and makes the exclusion of answers at $p = m$ unnecessary.
+- **As in Case 2, the power curve of the rank test reflects the shift model.** Shifting the answers breaks the ties at round amounts, so the rejection rate jumps instead of rising with the size of the effect. Closing the gap removes the jumps at the bound $p = m$, but not at round amounts.
+
+Overall, the case shows that rank-based methods are not automatically the better choice. Applied to one value per subject, they give a valid assessment of the effect, and they reveal that the effect is concentrated in part of the distribution. When the outcome is heavily rounded and the effect lies in the tail, however, the regression on the original values is the more powerful test.

@@ -1,0 +1,478 @@
+---
+title: "Case 1: Abeler et al. (2011)"
+subtitle: "Reference points and effort provision"
+author: "Johannes Valentin Solibieda"
+date: "November 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Figures used in the thesis: the chunk option fig.process = thesis_fig("caseN-name")
+# (together with dpi = 300, fig.retina = 1) copies the chunk's figure to ../Thesis/figures.
+thesis_fig <- function(name) function(path) {
+  file.copy(path, file.path("../Thesis/figures", paste0(name, ".png")), overwrite = TRUE)
+  path
+}
+```
+
+**Study:** Abeler, J., Falk, A., Goette, L. and Huffman, D. (2011). Reference Points and Effort Provision. *American Economic Review* 101(2): 470–492. <https://doi.org/10.1257/aer.101.2.470>
+
+**Data:** `Abeler et al. 2011/Original/` (original data and Stata do-file of the authors).
+
+This file reproduces all results, tables and figures of Case 1 (Section 4.1 of the thesis). It is self-contained: it reads the original data and defines every helper it uses. The sections follow the subsections of the case in the thesis.
+
+## Original study and research hypothesis
+
+Abeler, Falk, Goette and Huffman (2011) test whether an expectation-based reference point shapes effort. Subjects perform a tedious real-effort task (counting zeros in tables of 0s and 1s) and choose themselves when to stop working, for at most 60 minutes. Each correctly solved table adds a piece rate of €0.20 to their *accumulated earnings*. At the end, a coin flip decides whether a subject receives the accumulated earnings or a fixed payment $f$. The only difference between the two main treatments is the level of this fixed payment: $f = €3$ in LO and $f = €7$ in HI. A standard expected-utility agent should not react to $f$ at all. A reference-dependent agent, whose expectation $f$ acts as a reference point, should work longer when $f$ is higher and should be particularly likely to stop exactly when accumulated earnings reach $f$, because at that point the coin flip no longer matters.
+
+The case study concentrates on the main research hypothesis (Result 1 in the paper):
+
+> **RH1:** The level of the fixed payment $f$ affects effort, i.e. accumulated earnings (`profit_main`) are higher in HI than in LO.
+
+The authors' headline evidence for RH1 is an OLS regression of accumulated earnings on a HI dummy (Table 1). As supplementary evidence, they report a Wilcoxon rank-sum test and a Kolmogorov–Smirnov test.
+
+| Variable | Meaning |
+|----|----|
+| `profit_main` | Accumulated earnings in € (main outcome, steps of €0.20, floor at 0 by the experimental design) |
+| `time_total_work_min` | Working time in minutes (censored at 60) |
+| `treat_hi`, `treat_lo` | Treatment indicators (HI: $f = 7$, LO: $f = 3$) |
+| `neg_avg_time_cor_ans_pt` | Productivity in the practice stage (negative average time per correct answer) |
+| `female` | 1 if female |
+| `seoc` | 1 if the session took place in September/October (rather than June/July) |
+| `avg_temperature` | Room temperature in the session, used for the temperature controls |
+
+```{r c1-setup, message=FALSE, warning=FALSE}
+library(haven); library(dplyr); library(tidyr); library(ggplot2)
+library(AER)        # tobit
+library(lmtest)     # coeftest, bptest
+library(patchwork)  # combining ggplots
+
+ab <- read_dta("Abeler et al. 2011/Original/AER-2008-1240_R1_AbelerFalkGoetteHuffman2009_data_file.dta")
+
+temp_map <- c("2"=17.5,"3"=18.5,"4"=19,"5"=19,"6"=20,"7"=21,"8"=15,"9"=16.5,
+              "10"=16.5,"11"=13,"13"=19,"14"=20,"15"=21.5,"16"=20.5,"17"=18.5,
+              "25"=11,"26"=14.5,"27"=14,"28"=14,"29"=15,"30"=14.5,"31"=16.5,
+              "32"=21,"35"=14.5,"36"=13.5,"40"=15,"41"=14,"42"=16)
+
+ab <- ab %>% mutate(
+  neg_avg_time_cor_ans_pt = -avg_time_cor_ans_pt,
+  avg_temperature = unname(temp_map[as.character(grex_session)]),
+  controls_temperature = case_when(avg_temperature < 15 ~ 1,
+                                   avg_temperature > 20 ~ 3, TRUE ~ 2),
+  controls_time_of_day = case_when(abs_start_time >= 13 & abs_start_time <= 15.2 ~ 2,
+                                   abs_start_time > 15.2 ~ 3, TRUE ~ 1))
+
+# Only the two main treatments enter the comparison
+hilo <- ab %>%
+  filter(treat_lo == 1 | treat_hi == 1) %>%
+  mutate(group = factor(treat_hi, levels = c(0, 1), labels = c("LO (f = 3)", "HI (f = 7)")))
+
+ctrl <- "+ female + factor(controls_temperature) + factor(controls_time_of_day)"
+
+x  <- hilo$profit_main[hilo$treat_hi == 1]   # HI
+y  <- hilo$profit_main[hilo$treat_hi == 0]   # LO
+n1 <- length(x); n0 <- length(y)
+c(n_HI = n1, n_LO = n0)
+```
+
+## Data diagnostics and fit of the original analysis
+
+### Outcome distribution
+
+Before any test is run, the shape of the outcome distribution already shows which tools are appropriate. Accumulated earnings have a floor at zero, are right-skewed and are heavily tied: they move in steps of €0.20, and only `r length(unique(hilo$profit_main))` distinct values occur among `r nrow(hilo)` observations. Most importantly, the distribution is not smooth. There are pronounced spikes exactly at the two fixed payments. In LO, `r sum(abs(y - 3) < 1e-6)` subjects stop at €3 and `r sum(abs(y - 7) < 1e-6)` at €7; in HI it is `r sum(abs(x - 3) < 1e-6)` and `r sum(abs(x - 7) < 1e-6)`. This clustering is what the reference-point model predicts (Result 2 in the paper), but it also means that the treatment does not simply shift the whole distribution to the right. It moves mass from one spike to the other.
+
+```{r c1-desc}
+hilo %>%
+  group_by(group) %>%
+  summarise(n = n(), mean = mean(profit_main), sd = sd(profit_main),
+            median = median(profit_main),
+            q25 = quantile(profit_main, .25), q75 = quantile(profit_main, .75),
+            at_3 = sum(abs(profit_main - 3) < 1e-6),
+            at_7 = sum(abs(profit_main - 7) < 1e-6),
+            at_0 = sum(profit_main == 0), .groups = "drop")
+```
+
+```{r c1-fig-dist, fig.width=9, fig.height=4.5, dpi=300, fig.retina=1, fig.process=thesis_fig("case1-distribution")}
+p_hist <- ggplot(hilo, aes(profit_main, fill = group)) +
+  geom_histogram(binwidth = 0.5, boundary = 0, colour = "white") +
+  geom_vline(xintercept = c(3, 7), linetype = "dashed", colour = "gray30") +
+  facet_wrap(~ group, ncol = 1) +
+  scale_y_continuous(breaks = function(lim) seq(0, ceiling(lim[2]), by = 2)) +   # counts are discrete
+  labs(x = "Accumulated earnings (€)", y = "Count") +
+  theme_minimal(base_size = 12) + theme(legend.position = "none")
+
+# ECDF with the location of the maximal vertical distance (the KS statistic)
+grid  <- sort(unique(hilo$profit_main))
+gap   <- ecdf(y)(grid) - ecdf(x)(grid)
+x_ks  <- grid[which.max(abs(gap))]
+p_ecdf <- ggplot(hilo, aes(profit_main, colour = group)) +
+  stat_ecdf(geom = "step", linewidth = 0.9) +
+  geom_vline(xintercept = c(3, 7), linetype = "dashed", colour = "gray60") +
+  annotate("segment", x = x_ks, xend = x_ks,
+           y = ecdf(x)(x_ks), yend = ecdf(y)(x_ks), linewidth = 1.2) +
+  annotate("text", x = x_ks + 0.4, y = mean(c(ecdf(x)(x_ks), ecdf(y)(x_ks))),
+           label = sprintf("D = %.2f", max(abs(gap))), hjust = 0) +
+  labs(x = "Accumulated earnings (€)", y = "Empirical CDF", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+
+p_hist + p_ecdf
+```
+
+The ECDF of HI lies below that of LO almost everywhere, so HI subjects earn more across the whole distribution (approximate first-order stochastic dominance). The largest vertical gap, which is the KS statistic $D$, lies at €5, between the two reference points: by then the LO spike at €3 has already accumulated in the LO CDF, while the HI spike at €7 has not yet entered the HI CDF. The KS test is therefore not just a technical robustness check here; it measures exactly the reallocation of mass that the theory predicts.
+
+### Fit of the original analysis
+
+The authors' regression uses one observation per subject and all 120 subjects of the two main treatments, so it respects the independent unit. With a single binary regressor, it is identical to a two-sample $t$-test with pooled variance. This test is exact only under normally distributed errors; with $n = 60$ per group, it otherwise relies on the central limit theorem.
+
+```{r c1-qq, fig.width=10, fig.height=3.8}
+m1 <- lm(profit_main ~ treat_hi, data = hilo)   # Table 1, column 1
+qq_df <- bind_rows(
+  data.frame(panel = "HI: profit_main", v = x),
+  data.frame(panel = "LO: profit_main", v = y),
+  data.frame(panel = "OLS residuals (Table 1, col. 1)", v = resid(m1)))
+ggplot(qq_df, aes(sample = v)) +
+  stat_qq(size = 1.3) + stat_qq_line(colour = "red") +
+  facet_wrap(~ panel, scales = "free_y") +
+  labs(x = "Theoretical quantiles", y = "Sample quantiles") +
+  theme_minimal(base_size = 12)
+```
+
+```{r c1-normtests}
+data.frame(
+  check = c("Shapiro-Wilk, HI", "Shapiro-Wilk, LO",
+            "Shapiro-Wilk, OLS residuals", "Breusch-Pagan, Table 1 col. 1"),
+  p = c(shapiro.test(x)$p.value, shapiro.test(y)$p.value,
+        shapiro.test(resid(m1))$p.value, bptest(m1)$p.value)) %>%
+  knitr::kable(digits = 4)
+```
+
+Both Q-Q plots show the same pattern: a floor at zero, a flat stretch in the centre where the observations pile up at the reference points, and a long right tail. Normality is clearly rejected in both groups and for the residuals. Variances, on the other hand, are almost identical across groups (Breusch–Pagan p ≈ 0.99), so the authors' decision not to correct for heteroskedasticity is justified. The problem is therefore not heteroskedasticity but the *shape* of the distribution. Whether 60 observations per group are enough for the central limit theorem to rescue the $t$-test, and how much power it loses compared with rank-based tests, is an empirical question that the resampling simulations below answer.
+
+## Test choice and justification
+
+The diagnostics point to a comparison of two independent groups with a skewed, bounded and heavily tied outcome, in which the treatment changes the shape of the distribution rather than only shifting it. Following the decision table of the thesis (Section 3.4), this calls for the Wilcoxon rank-sum test and, because of the change in shape, the Kolmogorov–Smirnov (KS) test. Both tests are already reported by the authors as supplementary evidence.
+
+- The **Wilcoxon rank-sum test** asks whether HI subjects tend to earn more than LO subjects. Because it uses only the order of the earnings, the long upper tail does not dominate it as it dominates the mean. Its effect size is the Hodges–Lehmann (HL) estimate.
+- The **KS test** fits the theory especially well. Reference dependence predicts a reallocation of mass between €3 and €7 rather than a uniform shift, and the largest distance between the two distribution functions lies exactly between the two reference points. Because it has no direction and no natural effect size, it is reported together with the Wilcoxon test and the HL estimate.
+
+## Results
+
+### Replication of the original analysis
+
+The paper's main evidence is Table 1: OLS regressions of accumulated earnings and Tobit/OLS regressions of working time on the HI dummy, adding productivity and then gender, temperature and time-of-day controls. The table below collects the treatment coefficient from all nine specifications.
+
+```{r c1-table1}
+f1 <- profit_main ~ treat_hi
+f2 <- profit_main ~ treat_hi + neg_avg_time_cor_ans_pt
+f3 <- as.formula(paste("profit_main ~ treat_hi + neg_avg_time_cor_ans_pt", ctrl))
+ft <- function(f) update(f, time_total_work_min ~ .)
+
+t1 <- list(
+  "Earnings, OLS (1)"   = lm(f1, hilo),
+  "Earnings, OLS (2)"   = lm(f2, hilo),
+  "Earnings, OLS (3)"   = lm(f3, hilo),
+  "Time, OLS (1)"       = lm(ft(f1), hilo),
+  "Time, OLS (2)"       = lm(ft(f2), hilo),
+  "Time, OLS (3)"       = lm(ft(f3), hilo),
+  "Time, Tobit (1)"     = tobit(ft(f1), left = 0, right = 60, data = hilo),
+  "Time, Tobit (2)"     = tobit(ft(f2), left = 0, right = 60, data = hilo),
+  "Time, Tobit (3)"     = tobit(ft(f3), left = 0, right = 60, data = hilo))
+
+t1_tab <- bind_rows(lapply(names(t1), function(nm) {
+  ct <- coeftest(t1[[nm]])
+  data.frame(model = nm, estimate = ct["treat_hi", 1],
+             se = ct["treat_hi", 2], p = ct["treat_hi", 4])
+}))
+knitr::kable(t1_tab, digits = 3, row.names = FALSE)
+```
+
+The HI coefficient is positive and significant at the 5% level in all nine specifications. Earnings rise by about €1.85–1.97 and working time by about 6.4–8.4 minutes. However, the evidence is never stronger than that: every p-value lies between 0.028 and 0.046. Practice-stage productivity is a strong predictor of earnings (p ≈ 0.002) but not of working time. None of the controls (gender, temperature, time of day) is ever significant, and adding them barely moves the treatment coefficient, as one expects under random assignment.
+
+The authors' supplementary rank-based tests for the same comparison:
+
+```{r c1-np}
+np_tab <- data.frame(
+  outcome = rep(c("profit_main", "time_total_work_min"), each = 2),
+  test    = rep(c("Wilcoxon rank-sum", "Kolmogorov-Smirnov"), 2),
+  p = c(wilcox.test(profit_main ~ treat_hi, data = hilo, exact = FALSE)$p.value,
+        suppressWarnings(ks.test(x, y)$p.value),
+        wilcox.test(time_total_work_min ~ treat_hi, data = hilo, exact = FALSE)$p.value,
+        suppressWarnings(ks.test(hilo$time_total_work_min[hilo$treat_hi == 1],
+                                 hilo$time_total_work_min[hilo$treat_hi == 0])$p.value)))
+knitr::kable(np_tab, digits = 4)
+```
+
+For the main outcome, the rank-based tests are clearly *more* significant than the regression: OLS gives p = 0.046 (p = 0.030 with controls), the Wilcoxon test p = 0.015 and the KS test p = 0.006. For working time, the Wilcoxon test confirms the effect (p = 0.034), while the KS test does not (p = 0.119). The paper reports the same Wilcoxon p-values, but KS p-values of 0.005 (earnings, footnote 11) and 0.085 (working time, footnote 13). The difference comes from Stata and R computing the KS p-value differently. In the paper, the OLS coefficient is the headline result and the rank tests appear only as a supplement.
+
+### Rank-based tests and effect size
+
+The authors report the OLS coefficient, i.e. the difference in means, as the effect size. A natural alternative that matches the Wilcoxon test is the Hodges–Lehmann (HL) estimator, the median of all $n_1 n_0$ pairwise differences $x_i - y_j$. It equals the coefficient of a Theil–Sen regression on the treatment dummy, because with a binary regressor the only defined pairwise slopes are exactly these between-group differences. A confidence interval follows from inverting the Wilcoxon test.
+
+```{r c1-effect}
+wt <- wilcox.test(x, y, conf.int = TRUE, exact = FALSE)
+
+# Theil-Sen slope on the dummy: median of all pairwise slopes with different x
+theil_sen_dummy <- function(v, g) {
+  pairs <- outer(seq_along(v), seq_along(v), "<")
+  dx <- outer(g, g, "-")[pairs]; dy <- outer(v, v, "-")[pairs]
+  median(dy[dx != 0] / dx[dx != 0])
+}
+
+data.frame(
+  effect_size = c("Difference in means (OLS)", "Hodges-Lehmann", "Theil-Sen coefficient"),
+  estimate = c(mean(x) - mean(y), wt$estimate,
+               theil_sen_dummy(hilo$profit_main, hilo$treat_hi)),
+  ci_low  = c(confint(m1)["treat_hi", 1], wt$conf.int[1], NA),
+  ci_high = c(confint(m1)["treat_hi", 2], wt$conf.int[2], NA)) %>%
+  knitr::kable(digits = 3)
+```
+
+The HL estimate is €2.00 (95% CI [0.60, 3.60]), compared with a mean difference of €1.85 (95% CI [0.03, 3.67]), and the Theil–Sen coefficient on the dummy reproduces the HL value.
+
+**Why the rank-based tests are more sensitive.** The difference in p-values follows from the shape of the data. Earnings have a floor at zero but no fixed upper limit. The distribution is therefore right-skewed, with a few subjects earning far more than the rest (up to €25). These large values inflate the variance and thus the standard error of the OLS coefficient, which lowers the $t$-statistic. Rank-based tests only use the order of the observations: whether the top earner makes €15 or €25 does not change the ranks, so the upper tail has far less influence on the Wilcoxon and KS tests. The KS test gains additional power from the spikes at the reference points. As the histogram and ECDF in the diagnostics show, the treatment mainly moves subjects from €3 towards €7, and the KS statistic measures exactly this gap between the two distributions.
+
+### Brunner–Munzel check
+
+The Wilcoxon test is exact only when both groups have the same distribution. The Brunner–Munzel test drops this assumption and tests $H_0\colon p = \tfrac{1}{2}$ for the relative effect $p = P(X_{LO} < X_{HI}) + \tfrac{1}{2} P(X_{LO} = X_{HI})$ (Brunner and Munzel 2000). Its p-value is obtained from a studentised permutation test (Neubert and Brunner 2007), which is exact under identical distributions and asymptotically valid under $p = \tfrac{1}{2}$. The thesis states in a footnote (Section 4.5) that the test was applied in all cases and did not change any conclusion; this section documents the check for Case 1.
+
+```{r c1-bm, cache=TRUE}
+# Brunner-Munzel statistic for the relative effect p = P(a < b) + 0.5 P(a = b)
+bm <- function(a, b) {
+  na <- length(a); nb <- length(b); N <- na + nb
+  r  <- rank(c(a, b)); ra <- r[seq_len(na)]; rb <- r[-seq_len(na)]
+  ma <- mean(ra); mb <- mean(rb)
+  sa <- sum((ra - rank(a) - ma + (na + 1) / 2)^2) / (na - 1)
+  sb <- sum((rb - rank(b) - mb + (nb + 1) / 2)^2) / (nb - 1)
+  V  <- na * sa + nb * sb
+  list(W    = if (V == 0) sign(mb - ma) * Inf else na * nb * (mb - ma) / (N * sqrt(V)),
+       df   = if (V == 0) NA_real_ else V^2 / ((na * sa)^2 / (na - 1) + (nb * sb)^2 / (nb - 1)),
+       phat = (mb - (nb + 1) / 2) / na)
+}
+# Two-sided studentised permutation p-value and t-approximation
+bm_test <- function(a, b, B = 1e4, seed = 1) {
+  s <- bm(a, b); v <- c(a, b); na <- length(a)
+  set.seed(seed)
+  W_perm <- replicate(B, { i <- sample.int(length(v), na); bm(v[i], v[-i])$W })
+  c(phat = s$phat,
+    p_bm_permutation = (1 + sum(abs(W_perm) >= abs(s$W) - 1e-10)) / (B + 1),
+    p_bm_t = if (is.finite(s$W)) 2 * pt(-abs(s$W), s$df) else NA)
+}
+
+c(p_wilcoxon = wilcox.test(x, y, exact = FALSE)$p.value, bm_test(y, x))   # a = LO, b = HI
+```
+
+The Brunner–Munzel test gives practically the same p-value as the Wilcoxon test and does not change the conclusion.
+
+### Resampling simulations
+
+The simulations follow Section 3.5 of the thesis and answer three questions: (i) do the three tests keep their nominal size of 5% on data that look like these? (ii) which test has the most power against alternatives of the observed kind? (iii) how many subjects would each test have needed?
+
+#### Helper functions
+
+```{r c1-helpers}
+# p-values of the three tests on one simulated sample
+one_rep <- function(y1, y0) {
+  g <- c(rep(1L, length(y1)), rep(0L, length(y0)))
+  v <- c(y1, y0)
+  c(ols    = coef(summary(lm(v ~ g)))["g", "Pr(>|t|)"],
+    wilcox = suppressWarnings(wilcox.test(y1, y0, exact = FALSE)$p.value),
+    ks     = suppressWarnings(ks.test(y1, y0)$p.value))
+}
+
+# same, plus the shift actually realised and the share capped at 0
+one_rep2 <- function(y1, y0) {
+  c(one_rep(y1, y0),
+    d_mean  = mean(y1) - mean(y0),
+    d_hl    = median(outer(y1, y0, "-")),
+    clipped = mean(y1 == 0))
+}
+
+# Shift DGP: remove the observed shift from HI, then add delta back in.
+# Earnings have a floor at 0 in the experiment, so shifted values are capped at 0.
+make_dgp <- function(x, y, center = c("mean", "hl", "none")) {
+  center <- match.arg(center)
+  sh <- switch(center,
+               mean = mean(x) - mean(y),
+               hl   = median(outer(x, y, "-")),
+               none = 0)
+  x0 <- x - sh
+  function(delta = 0, n1 = length(x), n0 = length(y), clip = TRUE) {
+    s1 <- sample(x0, n1, replace = TRUE) + delta
+    s0 <- sample(y,  n0, replace = TRUE)
+    if (clip) s1 <- pmax(s1, 0)
+    list(y1 = s1, y0 = s0)
+  }
+}
+
+rej <- function(r, a = 0.05) colMeans(r[, c("ols", "wilcox", "ks"), drop = FALSE] < a, na.rm = TRUE)
+mc_se <- function(p, B) sqrt(p * (1 - p) / B)   # simulation standard error (error bars in the plots)
+```
+
+#### Size under the pooled null hypothesis and power at the observed effect
+
+Under the pooled null hypothesis, both groups are drawn from the *pooled* sample. The two distributions are then identical, $H_0$ holds exactly for all three tests at once, and the ties, the floor at zero and the spikes at €3 and €7 are all preserved.
+
+```{r c1-size, cache=TRUE}
+pooled <- hilo$profit_main
+B <- 5000
+
+set.seed(1)
+size <- t(replicate(B, one_rep2(sample(pooled, n1, replace = TRUE),
+                                sample(pooled, n0, replace = TRUE))))
+set.seed(2)
+pow_obs <- t(replicate(B, one_rep2(sample(x, n1, replace = TRUE),
+                                   sample(y, n0, replace = TRUE))))
+
+data.frame(test = c("OLS", "Wilcoxon", "KS"),
+           size = rej(size),
+           power_at_observed = rej(pow_obs)) %>%
+  knitr::kable(digits = 4, row.names = FALSE)
+```
+
+OLS (5.2%) and Wilcoxon (4.8%) both hold their nominal level, so the non-normality does *not* make the OLS test invalid at $n = 60$ per group. The KS test is conservative (3.6%): with more than half of the observations tied, its exact null distribution takes only few values, so its actual size lies below the nominal level.
+
+The second column resamples HI and LO separately, so the observed distributions are taken as the truth. Under this data-generating process, OLS rejects in about 53% of the replications, the Wilcoxon test in about 69% and the KS test in about 89%. As explained in Section 3.5 of the thesis, power at the observed effect is largely a function of the observed p-values, and the true effect is more likely to be smaller than the published one. The numbers are therefore read as a ranking of the three tests, not as the actual power of the experiment.
+
+#### Power curves
+
+To trace power as a function of the effect size, the observed shift is removed from the HI sample, either the mean difference or the HL estimate, and a shift $\delta = s\hat\theta$ is added back. Two problems arise:
+
+1.  **Which shift to remove.** Centring on the mean makes the *means* equal, but the HL shift stays positive, and vice versa. A shift null is therefore only a null for the test whose location measure was used to construct it. Neither centring gives the KS null of *identical distributions*, because the two groups still differ in shape.
+2.  **Capping at zero.** Subtracting €2 pushes some HI observations below zero, but earnings cannot be negative. They are therefore capped at 0, so the realised shift differs from the target. The realised mean and HL shifts are recorded in every replication.
+
+```{r c1-shift-null, cache=TRUE}
+B <- 2000
+size0 <- bind_rows(lapply(c("mean", "hl"), function(ct) {
+  dgp <- make_dgp(x, y, center = ct)
+  set.seed(1)
+  r <- t(replicate(B, { s <- dgp(0); one_rep2(s$y1, s$y0) }))
+  data.frame(center = ct, t(rej(r)),
+             real_mean = mean(r[, "d_mean"]), real_hl = mean(r[, "d_hl"]),
+             clipped = mean(r[, "clipped"]))
+}))
+knitr::kable(size0, digits = 4)
+```
+
+When the data is centred on the mean, OLS rejects in 5.3% of the replications (it tests the means, which are now equal). The Wilcoxon test rejects in 9.6%, because the realised HL shift is still about €0.27. The KS test rejects in 36%. That is not a failure of the KS test: the two distributions really differ in shape, and the KS test correctly detects it. When the data is centred on the HL estimate, OLS and Wilcoxon are both close to 5%, and the KS rejection rate falls to about 15%. That remaining 15% is the part of the treatment effect that is a change in shape rather than location, which matches the reallocation from €3 to €7 visible in the histograms.
+
+```{r c1-curves, cache=TRUE}
+# Effect strength s relative to the observed effect (s = 0: no effect, s = 1: observed effect)
+s_grid <- seq(0, 1.5, by = 0.05)
+B <- 2000
+theta_obs <- c(hl = median(outer(x, y, "-")), mean = mean(x) - mean(y))
+
+power_curve <- function(center) {
+  dgp <- make_dgp(x, y, center = center)
+  th  <- theta_obs[[center]]
+  set.seed(1)
+  bind_rows(lapply(s_grid, function(sv) {
+    r <- t(replicate(B, { d <- dgp(sv * th); one_rep2(d$y1, d$y0) }))
+    real <- if (center == "hl") mean(r[, "d_hl"]) else mean(r[, "d_mean"])
+    data.frame(center = center, s = sv, delta = sv * th,
+               method = c("ols", "wilcox", "ks"), power = rej(r),
+               s_real = real / th,   # realised effect as share of the observed one, in the centring's own measure
+               clipped = mean(r[, "clipped"]), n_sim = B)
+  }))
+}
+curves <- bind_rows(power_curve("hl"), power_curve("mean")) %>%
+  mutate(center = factor(center, c("hl", "mean"),
+                         c("Centred on HL shift", "Centred on mean difference")),
+         method = factor(method, c("ols", "wilcox", "ks"), c("OLS", "Wilcoxon", "KS")),
+         se = mc_se(power, n_sim))
+```
+
+```{r c1-fig-curves, fig.width=10, fig.height=8, dpi=300, fig.retina=1, fig.process=thesis_fig("case1-power-full")}
+plot_curve <- function(dat, xvar, xlab) {
+  ggplot(dat, aes(.data[[xvar]], power, colour = method)) +
+    geom_hline(yintercept = 0.05, linetype = "dashed", colour = "gray50") +
+    geom_vline(xintercept = 0, colour = "gray80") +
+    geom_errorbar(aes(ymin = power - 1.96 * se, ymax = power + 1.96 * se),
+                  width = 0, alpha = 0.4) +
+    geom_line(linewidth = 0.9) + geom_point(size = 1.3) +
+    facet_wrap(~ center) +
+    scale_y_continuous(limits = c(0, 1)) +
+    labs(x = xlab, y = "Rejection rate at α = 0.05", colour = NULL) +
+    theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+}
+
+(plot_curve(curves, "s", "Target effect s (1 = observed)") + theme(legend.position = "none")) /
+  plot_curve(curves, "s_real", "Realised effect (share of observed)")
+```
+
+```{r c1-fig-curves-realised, fig.width=10, fig.height=4.5, dpi=300, fig.retina=1, fig.process=thesis_fig("case1-power")}
+# Thesis main text: realised effect only (target and realised together: case1-power-full, appendix)
+plot_curve(curves, "s_real", "Realised effect (share of observed)")
+```
+
+```{r c1-fig-clip, fig.width=6, fig.height=3.5}
+curves %>% distinct(center, delta, clipped) %>%
+  ggplot(aes(delta, clipped, colour = center)) +
+  geom_line() + geom_point() +
+  labs(x = "Target shift δ (€)", y = "Share of HI capped at 0", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+```
+
+Along the whole power curve, the ordering is the same in both data-generating processes: KS > Wilcoxon > OLS. The curves of the rank tests rise in steps because earnings lie on a €0.20 grid with spikes at round amounts. A shift by an amount off this grid separates values that were tied: if a HI subject who earned exactly €7.00 is shifted by €0.13 to €6.87, they now rank below every LO subject with €7.00 instead of sharing their rank. Such changes in the ranks are much larger than the shift itself, so the rejection rate of the rank tests jumps whenever a shift crosses a spike (Section 3.5 of the thesis).
+
+#### Required sample size
+
+Finally, both groups are scaled by a common factor $\lambda$ and resampled from the observed groups. This yields the sample size each test would need for 80% or 90% power, *if* the observed effect were the true one.
+
+```{r c1-sizing, cache=TRUE}
+lambdas <- c(0.2, 0.4, 0.6, 0.8, 1, 1.2, 1.5, 2, 2.5, 3)
+B <- 2000
+
+set.seed(4)
+sizing <- bind_rows(lapply(lambdas, function(lam) {
+  n_T <- round(lam * n1); n_C <- round(lam * n0)
+  r <- t(replicate(B, one_rep(sample(x, n_T, replace = TRUE),
+                              sample(y, n_C, replace = TRUE))))
+  data.frame(lambda = lam, N = n_T + n_C,
+             method = c("ols", "wilcox", "ks"),
+             power = colMeans(r < 0.05, na.rm = TRUE), n_sim = B)
+}))
+
+# smallest N reaching the target power (linear interpolation)
+n_for <- function(n, p, target) {
+  if (max(p, na.rm = TRUE) < target) return(NA_real_)
+  approx(p, n, xout = target, ties = "ordered")$y
+}
+sizing %>% group_by(method) %>%
+  summarise(N_80 = n_for(N, power, 0.8), N_90 = n_for(N, power, 0.9), .groups = "drop") %>%
+  mutate(N_published = n1 + n0) %>%
+  knitr::kable(digits = 0)
+```
+
+```{r c1-fig-sizing, fig.width=8, fig.height=5, dpi=300, fig.retina=1, fig.process=thesis_fig("case1-samplesize")}
+sizing %>%
+  mutate(method = factor(method, c("ols", "wilcox", "ks"), c("OLS", "Wilcoxon", "KS")),
+         se = mc_se(power, n_sim)) %>%
+  ggplot(aes(N, power, colour = method)) +
+  geom_hline(yintercept = c(0.8, 0.9), linetype = "dashed", colour = "gray50") +
+  geom_vline(xintercept = n1 + n0, linetype = "dotdash", colour = "gray30") +
+  geom_errorbar(aes(ymin = power - 1.96 * se, ymax = power + 1.96 * se),
+                width = 4, alpha = 0.4) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  scale_x_continuous(name = "Total sample size N",
+                     sec.axis = sec_axis(~ . / (n1 + n0), name = expression(lambda),
+                                         breaks = lambdas)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(y = "Power at α = 0.05", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+```
+
+At the published sample size of 120, only the KS test exceeds 80% power. To reach 80% power, the Wilcoxon test would need about 160 subjects and OLS about 230, almost twice the actual sample. OLS would thus need about 1.4 times as many subjects as the Wilcoxon test. Since the absolute figures treat the observed effect as the true one, the ratio between the tests is the more robust result.
+
+## Interpretation
+
+The original conclusion is robust. Every parametric and rank-based procedure agrees that a higher fixed payment increases effort, and the result does not hinge on the OLS specification. The comparison yields three insights about test choice.
+
+- **The OLS $t$-test is valid but inefficient.** Its size is correct despite clearly non-normal data, but with a floor at zero, heavy ties and spikes at the reference points, the mean is a noisy summary. The authors' headline test is therefore the least powerful of the three tests they report.
+- **A rank-based analysis would have been a natural primary analysis.** The Wilcoxon test with the HL estimate gives a valid test together with a matching effect size. A difference in means is easier to communicate, but choosing it as the main specification leaves the stronger evidence in a supplementary role.
+- **The KS test is the test most consistent with the theory.** Reference dependence predicts that mass moves from €3 towards €7 rather than a uniform shift, and the KS test is the only test adequately powered at $N = 120$. Because it has neither a direction nor an effect size, it should be reported together with the HL estimate and a plot of the two distributions.
+
+Overall, the case shows that rank-based tests are not only applicable here but better suited than the authors' main test. The authors' regression is valid, but the outcome distribution and the prediction of the theory, a reallocation of mass between the reference points rather than a uniform shift, both favour tests that use the order or the whole distribution of earnings instead of their mean.

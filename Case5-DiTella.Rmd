@@ -1,0 +1,470 @@
+---
+title: "Case 5: Di Tella et al. (2015)"
+subtitle: "Self-serving beliefs about others' altruism"
+author: "Johannes Valentin Solibieda"
+date: "November 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Figures used in the thesis: the chunk option fig.process = thesis_fig("caseN-name")
+# (together with dpi = 300, fig.retina = 1) copies the chunk's figure to ../Thesis/figures.
+thesis_fig <- function(name) function(path) {
+  file.copy(path, file.path("../Thesis/figures", paste0(name, ".png")), overwrite = TRUE)
+  path
+}
+```
+
+**Study:** Di Tella, R., Perez-Truglia, R., Babino, A. and Sigman, M. (2015). Conveniently Upset: Avoiding Altruism by Distorting Beliefs about Others' Altruism. *American Economic Review* 105(11): 3416–3442. <https://doi.org/10.1257/aer.20141409>
+
+**Data:** `Di Tella 2015/` with `basic_game.dta` (Basic Game, 30 allocators) and `modified_game.dta` (Modified Game, 65 allocators); further games (`forced_seller`, `forced_allocator`, `conditional_game`) are not used here.
+
+This file reproduces all results, tables and figures of Case 5 (Section 4.5 of the thesis). It is self-contained: it reads the original data and defines every helper it uses. The sections follow the subsections of the case in the thesis.
+
+## Original study and research hypothesis
+
+"Corruption game". An allocator and a seller have each earned 10 tokens. Simultaneously, the allocator splits the 20 tokens and the seller chooses the price at which tokens are converted into money: Option A (fair, high price) or Option B (low price plus a side payment for the seller only). Allocators are randomly assigned to *Able=8* (may move up to 8 tokens) or *Able=2* (up to 2 tokens); sellers do not know about this. Allocators then state whether they believe their seller chose B (*Is Corrupt*) and which share of sellers chose B (*%-Corrupt*, 10 categories).
+
+> **RH1:** Allocators who can take more tokens (Able=8) are more likely to believe that the seller acted unkindly (chose Option B) than allocators who can take only 2 tokens (Able=2).
+
+Precondition (manipulation check): Able=8 allocators actually take more tokens. The authors test both with OLS on the treatment dummy and heteroskedasticity-robust standard errors (HC1), without and with controls (female, age, socioeconomic class), in the Basic Game (n = 30) and the Modified Game (n = 65). The corresponding Stata commands in `replicate_results.do` (Table 4, top half) are:
+
+```{md, eval=FALSE}
+use basic_game, clear            // analogous: modified_game
+* Column (1)/(3): treatment dummy only
+reg tokenstaken treat, robust
+reg is_corrupt treat, robust
+reg perc_corrupt treat, robust
+* Column (2)/(4): with controls
+reg tokenstaken treat female age class, robust
+reg is_corrupt treat female age class, robust
+reg perc_corrupt treat female age class, robust
+* second half of Table 4: ivreg is_corrupt (tokenstaken = treat), robust
+```
+
+Table 3 reports the corresponding mean-difference tests ("standard mean difference test").
+
+```{r c5-setup, message=FALSE, warning=FALSE}
+library(haven); library(dplyr); library(tidyr); library(ggplot2); library(patchwork)
+library(lmtest); library(sandwich); library(coin)
+
+load_game <- function(file, game) {
+  read_dta(file.path("Di Tella 2015", file)) %>% zap_labels() %>%
+    mutate(game = game,
+           perc_corrupt = round(perc_corrupt, 1),          # stored as float (0.1000000015)
+           group = factor(treat, levels = c(0, 1), labels = c("Able=2", "Able=8"))) %>%
+    select(game, treat, group, tokenstaken, is_corrupt, perc_corrupt, female, age, class)
+}
+dt <- bind_rows(load_game("basic_game.dta", "Basic"),
+                load_game("modified_game.dta", "Modified")) %>%
+  mutate(game = factor(game, levels = c("Basic", "Modified")))
+
+dt %>% count(game, group)
+```
+
+## Data diagnostics and fit of the original analysis
+
+```{r c5-diag}
+# support of the outcomes by treatment
+dt %>% group_by(game, group) %>%
+  summarise(n = n(), tokens_min = min(tokenstaken), tokens_max = max(tokenstaken),
+            tokens_at_cap = mean(tokenstaken == ifelse(treat == 1, 8, 2)),
+            is_corrupt = mean(is_corrupt), perc_corrupt = mean(perc_corrupt),
+            perc_values = n_distinct(perc_corrupt), .groups = "drop")
+
+# ties: share of observations sharing their value with another observation
+dt %>% group_by(game) %>%
+  summarise(across(c(tokenstaken, perc_corrupt),
+                   ~ mean(duplicated(.x) | duplicated(.x, fromLast = TRUE))), .groups = "drop")
+
+# normality of the belief within groups
+dt %>% group_by(game, group) %>% summarise(shapiro_p = shapiro.test(perc_corrupt)$p.value, .groups = "drop")
+
+# missing controls (Modified Game: female missing for 4 allocators, all Able=2)
+dt %>% group_by(game, group) %>% summarise(female_missing = sum(is.na(female)), .groups = "drop")
+
+# Note: in the data, the Modified Game has 31 Able=2 and 34 Able=8 allocators; Table 3 of the
+# paper lists the counts the other way round (the means match the data as stored).
+```
+
+```{r c5-fig, fig.width=10, fig.height=6, dpi=300, fig.retina=1, fig.process=thesis_fig("case5-dist")}
+bars <- function(var, lab, xlab) {
+  dt %>% count(game, group, v = .data[[var]]) %>%
+    ggplot(aes(factor(v, levels = lab), n, fill = group)) +
+    geom_col(position = position_dodge(preserve = "single"), width = 0.75) +
+    facet_wrap(~ game, ncol = 1, scales = "free_y") +
+    scale_x_discrete(drop = FALSE) +
+    labs(x = xlab, y = "Allocators", fill = NULL) +
+    theme_minimal(base_size = 11)
+}
+p_tok  <- bars("tokenstaken", 0:8, "Tokens taken")
+p_perc <- bars("perc_corrupt", seq(0, 0.9, 0.1), "%-Corrupt (lower bound of the category)")
+p_dist <- p_tok + p_perc + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+p_dist
+```
+
+Tokens taken in Able=2 can only take the values 0–2, so the precondition is largely mechanical. *Is Corrupt* is binary and *%-Corrupt* is an ordinal variable with 10 categories, so both outcomes are heavily tied, and with 15 allocators per group (Basic Game) asymptotic approximations are questionable.
+
+Every allocator decides once, without feedback and anonymously, so the allocator is the independent unit and the data contains one observation per unit. The authors' OLS with robust standard errors tests the null hypothesis that the mean outcome is the same in both groups; with 15 allocators per group in the Basic Game, its validity rests on asymptotic approximations.
+
+## Test choice and justification
+
+The comparison is a simple two-group comparison, and the natural counterpart from the test battery is the **Wilcoxon rank-sum test** (Section 3.4 of the thesis), with the Hodges–Lehmann shift as effect size:
+
+- *Tokens Taken* is a count and *%-Corrupt* has ten equal-width categories, so their means are meaningful. The rank test uses only their order and asks whether Able=8 allocators tend to give higher values, rather than whether their mean differs; with few distinct values, this order is less informative than for a continuous outcome.
+- *Is Corrupt* is binary. The rank-sum test then only compares the shares of allocators answering "Option B", and its exact version is Fisher's exact test. The difference in proportions is reported as the effect size.
+- Because of the small samples and the many ties, the Wilcoxon test is computed **exactly** (permutation distribution conditional on the ties, `coin`) in addition to the normal approximation.
+
+The Kolmogorov–Smirnov test is not used, because RH1 predicts a direction. With only ten categories of *%-Corrupt* and 15 allocators per group in the Basic Game, the many ties would make it even weaker; for *Is Corrupt*, it adds nothing to the exact test, and for *Tokens Taken*, the distributions differ already by design.
+
+As counterpart to the columns with controls, the Wilcoxon test is applied to residuals from a regression of the outcome on female, age and class, estimated *without* the treatment dummy (as in Case 4).
+
+## Results
+
+### Replication of the original analysis
+
+```{r c5-replication}
+ols_row <- function(d, y, controls) {
+  f <- as.formula(paste(y, "~ treat", if (controls) "+ female + age + class" else ""))
+  m <- lm(f, data = d)
+  ct <- coeftest(m, vcov = vcovHC(m, type = "HC1"))["treat", ]   # Stata: reg, robust (t with n - k df)
+  data.frame(estimate = ct[1], se = ct[2], p = ct[4], n = nobs(m))
+}
+grid4 <- expand.grid(y = c("tokenstaken", "is_corrupt", "perc_corrupt"), controls = c(FALSE, TRUE),
+                     game = levels(dt$game), stringsAsFactors = FALSE)
+t4 <- bind_cols(grid4, bind_rows(lapply(seq_len(nrow(grid4)), function(i)
+  ols_row(dt[dt$game == grid4$game[i], ], grid4$y[i], grid4$controls[i]))))
+knitr::kable(t4, digits = 3)
+
+# Table 3: standard mean-difference test (two-sample t-test)
+dt %>% group_by(game) %>%
+  summarise(across(c(tokenstaken, is_corrupt, perc_corrupt),
+                   ~ t.test(.x ~ treat, var.equal = TRUE)$p.value), .groups = "drop")
+```
+
+Table 4 (top half) reproduces exactly. The regressions with controls in the Modified Game use 61 observations (female is missing for 4 allocators), not 65 as stated in the paper.
+
+### Rank-based tests
+
+```{r c5-rank-tests}
+rank_row <- function(d, y) {
+  w  <- wilcox.test(as.formula(paste(y, "~ group")), data = d, exact = FALSE, conf.int = TRUE)
+  we <- pvalue(wilcox_test(as.formula(paste(y, "~ group")), data = d, distribution = "exact"))
+  m  <- lm(as.formula(paste(y, "~ female + age + class")), data = d, na.action = na.exclude)
+  dr <- data.frame(r = residuals(m), group = d$group) %>% filter(!is.na(r))
+  wr <- wilcox.test(r ~ group, data = dr, exact = FALSE, conf.int = TRUE)
+  wre <- pvalue(wilcox_test(r ~ group, data = dr, distribution = "exact"))
+  diff_prop <- if (y == "is_corrupt") diff(tapply(d[[y]], d$group, mean)) else NA
+  data.frame(HL = -unname(w$estimate), HL_lo = -w$conf.int[2], HL_hi = -w$conf.int[1],   # Able=8 minus Able=2
+             diff_prop = unname(diff_prop),
+             p_asym = w$p.value, p_exact = as.numeric(we),
+             HL_res = -unname(wr$estimate), p_res_asym = wr$p.value, p_res_exact = as.numeric(wre),
+             n_res = nrow(dr))
+}
+gridr <- expand.grid(y = c("tokenstaken", "is_corrupt", "perc_corrupt"), game = levels(dt$game),
+                     stringsAsFactors = FALSE)
+rk <- bind_cols(gridr, bind_rows(lapply(seq_len(nrow(gridr)), function(i)
+  rank_row(dt[dt$game == gridr$game[i], ], gridr$y[i]))))
+knitr::kable(rk, digits = 4)
+
+# exact Wilcoxon on a binary outcome = Fisher's exact test
+dt %>% group_by(game) %>% summarise(fisher_p = fisher.test(table(treat, is_corrupt))$p.value)
+```
+
+```{r c5-compare}
+# OLS vs. rank tests side by side
+cmp <- t4 %>% filter(!controls) %>% select(game, y, p_ols = p) %>%
+  left_join(t4 %>% filter(controls) %>% select(game, y, p_ols_ctrl = p), by = c("game", "y")) %>%
+  left_join(rk %>% select(game, y, p_asym, p_exact, p_res_exact), by = c("game", "y"))
+knitr::kable(cmp, digits = 3)
+```
+
+```{r c5-binary-residuals}
+# Why the residual test is weak for Is Corrupt: fitted values lie in a narrow range, so residuals
+# keep the 0/1 split (no overlap) and only reorder allocators *within* each answer by their controls,
+# which is unrelated to the treatment and adds noise.
+m_b <- lm(is_corrupt ~ female + age + class, data = filter(dt, game == "Modified"), na.action = na.exclude)
+range(fitted(m_b), na.rm = TRUE)
+tapply(residuals(m_b), filter(dt, game == "Modified")$is_corrupt, range, na.rm = TRUE)
+```
+
+- **Tokens Taken:** all tests reject clearly ($p < 0.001$); the HL shift is 6 tokens in both games. The precondition holds, but largely mechanically, since Able=2 allocators cannot take more than 2 tokens.
+- **Is Corrupt, Basic Game:** OLS $p = 0.019$, asymptotic Wilcoxon $p = 0.024$, but the exact test (= Fisher) gives $p = 0.050$. With 15 allocators per group and a binary outcome, the exact test can attain only a few p-values: the observed data, 7 of 15 Able=2 and 13 of 15 Able=8 allocators answering "Option B", give exactly $p = 0.050$; one more Able=8 allocator answering "Option B" would give $p = 0.014$, one fewer $p = 0.128$. The resampling simulations below show that this gap is due mainly to the conservativeness of the exact test. With controls, OLS $p = 0.042$, residual Wilcoxon (exact) $p = 0.051$.
+- **%-Corrupt, Basic Game:** OLS $p = 0.078$, Wilcoxon $p = 0.133$ (exact and asymptotic). The HL shift of 0.2, two categories, equals the OLS coefficient, but its 95% confidence interval [0.0, 0.5] reaches zero. The difference between the groups comes largely from five Able=2 allocators who believe that almost no seller is corrupt (0–20%), whereas both groups overlap strongly at high values.
+- **Modified Game:** all tests without controls reject at the 1% level, and the exact tests confirm the approximate ones (n = 65). With controls, the residual Wilcoxon test confirms the effect on %-Corrupt ($p = 0.006$) but not on Is Corrupt ($p = 0.092$): the fitted values from the controls vary only in a narrow range, so for a binary outcome the residuals keep the two answer groups separated and only reorder the allocators within each answer by their controls, which adds noise unrelated to the treatment. Since the treatment was randomised, the controls are not needed for a valid test.
+
+```{r c5-check-details}
+# details quoted above: exact p-values attainable for Is Corrupt in the Basic Game,
+# and the low beliefs of Able=2 allocators for %-Corrupt
+bas <- filter(dt, game == "Basic")
+table(bas$group, bas$is_corrupt)
+sapply(c(12, 13, 14), function(k) fisher.test(matrix(c(15 - 7, 7, 15 - k, k), 2))$p.value)
+table(bas$group, bas$perc_corrupt)
+```
+
+### Brunner–Munzel check
+
+The Wilcoxon test is exact only when both groups have the same distribution (Chung and Romano 2013). The Brunner–Munzel test drops this assumption and tests $H_0\colon p = \tfrac{1}{2}$ for the relative effect $p = P(X_{2} < X_{8}) + \tfrac{1}{2} P(X_{2} = X_{8})$ (Brunner and Munzel 2000). Its p-value is obtained from a studentised permutation test (Neubert and Brunner 2007). The thesis states in a footnote (Section 4.5) that the test was applied in all cases and did not change any conclusion, and that *Tokens Taken* is the case in which it was most likely to matter: Able=2 allocators can take at most 2 tokens, Able=8 allocators up to 8, so the cap makes the variances differ by design.
+
+```{r c5-bm, cache=TRUE}
+# Brunner-Munzel statistic for the relative effect p = P(a < b) + 0.5 P(a = b)
+bm <- function(a, b) {
+  na <- length(a); nb <- length(b); N <- na + nb
+  r  <- rank(c(a, b)); ra <- r[seq_len(na)]; rb <- r[-seq_len(na)]
+  ma <- mean(ra); mb <- mean(rb)
+  sa <- sum((ra - rank(a) - ma + (na + 1) / 2)^2) / (na - 1)
+  sb <- sum((rb - rank(b) - mb + (nb + 1) / 2)^2) / (nb - 1)
+  V  <- na * sa + nb * sb
+  list(W    = if (V == 0) sign(mb - ma) * Inf else na * nb * (mb - ma) / (N * sqrt(V)),
+       df   = if (V == 0) NA_real_ else V^2 / ((na * sa)^2 / (na - 1) + (nb * sb)^2 / (nb - 1)),
+       phat = (mb - (nb + 1) / 2) / na,
+       se   = sqrt(V) / (na * nb))
+}
+
+# Check against the example in the manual of the R package brunnermunzel
+# (statistic = 3.1375, df = 17.683, p = 0.005786)
+ex <- bm(c(1,2,1,1,1,1,1,1,1,1,2,4,1,1), c(3,3,4,3,1,2,3,1,1,5,4))
+round(c(statistic = ex$W, df = ex$df, p = 2 * pt(-abs(ex$W), ex$df)), 6)
+
+B_perm <- 100000
+bm_tokens <- bind_rows(lapply(levels(dt$game), function(g) {
+  d <- filter(dt, game == g, !is.na(tokenstaken))
+  a <- d$tokenstaken[d$treat == 0]; b <- d$tokenstaken[d$treat == 1]
+  s <- bm(a, b); q <- qt(.975, s$df); v <- c(a, b)
+  set.seed(11)
+  W_perm <- replicate(B_perm, { i <- sample.int(length(v), length(a)); bm(v[i], v[-i])$W })
+  data.frame(game = g, n_able2 = length(a), n_able8 = length(b),
+             sd_able2 = sd(a), sd_able8 = sd(b), var_ratio = var(b) / var(a),
+             p_wilcoxon = suppressWarnings(wilcox.test(b, a, exact = FALSE)$p.value),
+             p_wilcoxon_exact = as.numeric(pvalue(wilcox_test(tokenstaken ~ group, data = d, distribution = "exact"))),
+             p_bm_perm = (1 + sum(abs(W_perm) >= abs(s$W) - 1e-10)) / (B_perm + 1),
+             p_bm_t = 2 * pt(-abs(s$W), s$df), df_bm = s$df,
+             phat = s$phat, ci_low = s$phat - q * s$se, ci_high = min(1, s$phat + q * s$se))
+}))
+knitr::kable(t(bm_tokens), digits = 6)
+
+# Beliefs: same test with B = 10,000 permutations
+bm_test <- function(a, b, B = 1e4, seed = 1) {
+  s <- bm(a, b); v <- c(a, b); na <- length(a)
+  set.seed(seed)
+  W_perm <- replicate(B, { i <- sample.int(length(v), na); bm(v[i], v[-i])$W })
+  c(phat = s$phat,
+    p_bm_permutation = (1 + sum(abs(W_perm) >= abs(s$W) - 1e-10)) / (B + 1),
+    p_bm_t = if (is.finite(s$W)) 2 * pt(-abs(s$W), s$df) else NA)
+}
+bm_beliefs <- bind_rows(lapply(levels(dt$game), function(g) bind_rows(lapply(c("is_corrupt", "perc_corrupt"), function(v) {
+  d <- filter(dt, game == g)
+  a <- d[[v]][d$treat == 0]; b <- d[[v]][d$treat == 1]
+  data.frame(game = g, outcome = v,
+             p_wilcoxon_asymptotic = suppressWarnings(wilcox.test(b, a, exact = FALSE)$p.value),
+             p_wilcoxon_exact = as.numeric(pvalue(wilcox_test(as.formula(paste(v, "~ group")), data = d, distribution = "exact"))),
+             t(bm_test(a, b)))
+}))))
+knitr::kable(bm_beliefs, digits = 4, row.names = FALSE)
+```
+
+The variances of *Tokens Taken* differ markedly, by a factor of 11.3 in the Basic Game and 4.7 in the Modified Game, as the design leads one to expect. The Brunner–Munzel test nevertheless reaches the same conclusion as the Wilcoxon test in both games. For the beliefs, the permutation p-values of the Brunner–Munzel test agree with the exact Wilcoxon test and its $t$-approximation with the asymptotic one; for *Is Corrupt* in the Basic Game, it reproduces the same split between exact ($p \approx 0.05$) and asymptotic ($p \approx 0.02$) inference discussed above. It does not change any conclusion.
+
+### Resampling simulations
+
+The simulation follows Section 3.5 of the thesis. Every allocator is one independent observation, so data sets are built by resampling allocators. Compared are the authors' OLS without controls (robust HC1 standard errors, as in columns 1 and 3) and the Wilcoxon rank-sum test, both with normal approximation and exact (for the binary *Is Corrupt*, the exact test is Fisher's exact test). *Tokens Taken* is not simulated: under a pooled null hypothesis, Able=2 allocators would take more than 2 tokens, which the design rules out, and all tests reject with $p < 0.001$ anyway. The Basic and the Modified Game are simulated separately.
+
+**Size under the pooled null hypothesis.** Allocators are drawn with replacement from all allocators of a game and randomly split into the original group sizes (15/15 and 31/34).
+
+**Data-generating process for the power.**
+
+- *%-Corrupt:* every treated value is shifted additively and capped to the scale $[0, 0.9]$, with the difference in means as $\hat\theta$ (mean centring) or the Hodges–Lehmann shift (HL centring).
+- *Is Corrupt:* as for binary outcomes in Section 3.5, the probability is shifted: treated allocators answer "Option B" with probability $\hat p_2 + s(\hat p_8 - \hat p_2)$, capped to $[0, 1]$; control allocators are resampled.
+
+**Sample size.** At the observed effect, both groups are scaled by a common factor $\lambda$, so that the ratio of the group sizes is kept. The required sample size is reported as the total number of allocators.
+
+```{r c5-sim-params, cache=TRUE}
+# ---- Parameters (change here) ---------------------------------------------
+s_grid_d   <- seq(0, 1.5, by = 0.05)
+N_grid_d   <- c(20, 30, 40, 50, 60, 80, 100, 130, 160, 200, 260)   # total allocators; lambda = N / N_obs
+B_size_d   <- 5000
+B_d        <- 1000
+alpha_d    <- 0.05
+cores_d    <- max(1, parallel::detectCores() - 1)   # parallel replications (macOS/Linux)
+```
+
+```{r c5-sim-helpers}
+# OLS on the treatment dummy with HC1 standard errors (= reg y treat, robust)
+ols_hc1 <- function(y, tr) {
+  yT <- y[tr == 1]; yC <- y[tr == 0]; nT <- length(yT); nC <- length(yC); n <- nT + nC
+  b <- mean(yT) - mean(yC)
+  v <- n / (n - 2) * (sum((yT - mean(yT))^2) / nT^2 + sum((yC - mean(yC))^2) / nC^2)
+  if (v == 0) return(as.numeric(b == 0))          # both groups constant
+  2 * pt(-abs(b / sqrt(v)), n - 2)
+}
+wil_asym <- function(y, tr) {
+  if (length(unique(y)) == 1) return(1)
+  suppressWarnings(wilcox.test(y[tr == 1], y[tr == 0], exact = FALSE)$p.value)
+}
+wil_exact <- function(y, tr) {
+  if (length(unique(y)) == 1) return(1)
+  if (all(y %in% c(0, 1))) return(fisher.test(table(factor(tr, 0:1), factor(y, 0:1)))$p.value)
+  as.numeric(pvalue(wilcox_test(y ~ factor(tr), data = data.frame(y = y, tr = tr), distribution = "exact")))
+}
+tests_d <- function(y, tr) c(ols = ols_hc1(y, tr), wil_asym = wil_asym(y, tr), wil_exact = wil_exact(y, tr))
+lab_d <- c(ols = "OLS, robust SE (paper)", wil_asym = "Wilcoxon, normal approx.", wil_exact = "Wilcoxon, exact")
+
+# check against the results above
+dt %>% group_by(game) %>%
+  summarise(is = list(tests_d(is_corrupt, treat)), perc = list(tests_d(perc_corrupt, treat)), .groups = "drop") %>%
+  tidyr::unnest_wider(c(is, perc), names_sep = "_")
+
+obs_d <- lapply(split(dt, dt$game), function(d) list(
+  is_T = d$is_corrupt[d$treat == 1], is_C = d$is_corrupt[d$treat == 0],
+  pc_T = d$perc_corrupt[d$treat == 1], pc_C = d$perc_corrupt[d$treat == 0],
+  theta = c(mean = mean(d$perc_corrupt[d$treat == 1]) - mean(d$perc_corrupt[d$treat == 0]),
+            hl = median(outer(d$perc_corrupt[d$treat == 1], d$perc_corrupt[d$treat == 0], "-"))),
+  pT = mean(d$is_corrupt[d$treat == 1]), pC = mean(d$is_corrupt[d$treat == 0])))
+sapply(obs_d, function(o) c(o$theta, p_diff = o$pT - o$pC))
+
+sim_d <- function(o, outcome, s, center = "mean", nT = length(o$pc_T), nC = length(o$pc_C)) {
+  if (outcome == "is_corrupt") {
+    yT <- rbinom(nT, 1, min(max(o$pC + s * (o$pT - o$pC), 0), 1))
+    yC <- sample(o$is_C, nC, TRUE); theta <- o$pT - o$pC
+  } else {
+    yT <- pmin(pmax(sample(o$pc_T, nT, TRUE) - (1 - s) * o$theta[[center]], 0), 0.9)
+    yC <- sample(o$pc_C, nC, TRUE); theta <- o$theta[["mean"]]
+  }
+  y <- c(yT, yC); tr <- c(rep(1, nT), rep(0, nC))
+  c(tests_d(y, tr), s_real = (mean(yT) - mean(yC)) / theta)
+}
+```
+
+**Size under the pooled null hypothesis.**
+
+```{r c5-sim-size, cache=TRUE, dependson="c5-sim-params"}
+set.seed(71)
+size_d <- bind_rows(lapply(levels(dt$game), function(g) {
+  d <- filter(dt, game == g); nT <- sum(d$treat); n <- nrow(d)
+  bind_rows(lapply(c("is_corrupt", "perc_corrupt"), function(y) {
+    r <- t(replicate(B_size_d, {
+      yy <- sample(d[[y]], n, TRUE); tr <- sample(c(rep(1, nT), rep(0, n - nT)))
+      tests_d(yy, tr)
+    }))
+    data.frame(game = g, outcome = y, test = unname(lab_d), size = colMeans(r < alpha_d))
+  }))
+})) %>% mutate(mc_se = sqrt(size * (1 - size) / B_size_d))
+size_d %>% select(-mc_se) %>% pivot_wider(names_from = test, values_from = size) %>% knitr::kable(digits = 3)
+```
+
+**Power curves.**
+
+```{r c5-sim-curves, cache=TRUE, dependson="c5-sim-params"}
+specs_d <- list(c("is_corrupt", "mean"), c("perc_corrupt", "mean"), c("perc_corrupt", "hl"))
+RNGkind("L'Ecuyer-CMRG"); set.seed(72)
+curves_d <- bind_rows(lapply(levels(dt$game), function(g) bind_rows(lapply(specs_d, function(sp) {
+  bind_rows(parallel::mclapply(s_grid_d, mc.cores = cores_d, FUN = function(sv) {
+    r <- t(replicate(B_d, sim_d(obs_d[[g]], sp[1], sv, center = sp[2])))
+    data.frame(game = g, outcome = sp[1], center = sp[2], s = sv, s_real = mean(r[, "s_real"]),
+               test = unname(lab_d), power = colMeans(r[, names(lab_d)] < alpha_d), n_sim = B_d)
+  }))
+})))) %>%
+  mutate(variant = factor(paste(outcome, center), c("is_corrupt mean", "perc_corrupt mean", "perc_corrupt hl"),
+                          c("Is Corrupt", "%-Corrupt, mean", "%-Corrupt, HL")),
+         game = factor(game, levels(dt$game)), test = factor(test, lab_d),
+         se = sqrt(power * (1 - power) / n_sim))
+
+curves_d %>% filter(s %in% c(0, 0.5, 1, 1.5)) %>% select(game, variant, s, s_real, test, power) %>%
+  pivot_wider(names_from = test, values_from = power) %>% knitr::kable(digits = 3)
+```
+
+```{r c5-fig-sim-curves, fig.width=10, fig.height=12}
+plot_curves_d <- function(cd) {
+  cd %>% pivot_longer(c(s, s_real), names_to = "axis", values_to = "x") %>%
+    mutate(axis = factor(axis, c("s", "s_real"), c("Target effect s", "Realised effect (share of observed)")),
+           row = factor(paste(game, variant, sep = ": "),
+                        levels = as.vector(outer(levels(cd$game), levels(droplevels(cd$variant)), paste, sep = ": ")))) %>%
+    ggplot(aes(x, power, colour = test)) +
+    geom_hline(yintercept = alpha_d, linetype = "dashed", colour = "gray50") +
+    geom_errorbar(aes(ymin = power - 1.96 * se, ymax = power + 1.96 * se), width = 0, alpha = 0.4) +
+    geom_line(linewidth = 0.8) + geom_point(size = 1) +
+    facet_grid(row ~ axis) +
+    scale_y_continuous(limits = c(0, 1)) +
+    labs(x = "Strength of the effect (1 = observed)", y = "Rejection rate at α = 0.05", colour = NULL) +
+    theme_minimal(base_size = 10) + theme(legend.position = "bottom", strip.text.y = element_text(angle = 0))
+}
+plot_curves_d(curves_d)
+```
+
+```{r c5-fig-sim-curves-thesis, fig.width=10, fig.height=9, dpi=300, fig.retina=1, fig.process=thesis_fig("case5-power-full")}
+# compact version for the thesis: mean centring
+# label without "mean": the thesis figure shows the mean centring only (stated in the caption)
+p_curves_d <- plot_curves_d(filter(curves_d, center == "mean") %>%
+  mutate(variant = droplevels(variant), variant = factor(variant, levels(variant), sub(", mean", "", levels(variant)))))
+p_curves_d
+```
+
+```{r c5-fig-sim-curves-realised, fig.width=10, fig.height=7, dpi=300, fig.retina=1, fig.process=thesis_fig("case5-power")}
+# Thesis main text: realised effect only (target and realised together: case5-power-full, appendix)
+filter(curves_d, center == "mean") %>%
+  mutate(variant = droplevels(variant), variant = factor(variant, levels(variant), sub(", mean", "", levels(variant)))) %>%
+  mutate(row = factor(paste(game, variant, sep = ": "),
+                      levels = as.vector(outer(levels(game), levels(variant), paste, sep = ": ")))) %>%
+  ggplot(aes(s_real, power, colour = test)) +
+  geom_hline(yintercept = alpha_d, linetype = "dashed", colour = "gray50") +
+  geom_errorbar(aes(ymin = power - 1.96 * se, ymax = power + 1.96 * se), width = 0, alpha = 0.4) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1) +
+  facet_wrap(~ row, ncol = 2) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Realised effect (share of observed)", y = "Rejection rate at α = 0.05", colour = NULL) +
+  theme_minimal(base_size = 10) + theme(legend.position = "bottom")
+```
+
+**Required number of allocators.**
+
+```{r c5-sim-sizing, cache=TRUE, dependson="c5-sim-params"}
+RNGkind("L'Ecuyer-CMRG"); set.seed(73)
+sizing_d <- bind_rows(lapply(levels(dt$game), function(g) bind_rows(lapply(c("is_corrupt", "perc_corrupt"), function(y)
+  bind_rows(parallel::mclapply(N_grid_d, mc.cores = cores_d, FUN = function(N) {
+    o <- obs_d[[g]]; lam <- N / (length(o$pc_T) + length(o$pc_C))   # common scaling factor
+    nT <- round(lam * length(o$pc_T)); nC <- round(lam * length(o$pc_C))
+    r <- t(replicate(B_d, sim_d(o, y, 1, nT = nT, nC = nC)))
+    data.frame(game = g, outcome = y, lambda = lam, N_total = nT + nC, test = unname(lab_d),
+               power = colMeans(r[, names(lab_d)] < alpha_d), n_sim = B_d)
+  })))))) %>%
+  mutate(game = factor(game, levels(dt$game)), test = factor(test, lab_d),
+         outcome = factor(outcome, c("is_corrupt", "perc_corrupt"), c("Is Corrupt", "%-Corrupt")),
+         se = sqrt(power * (1 - power) / n_sim))
+
+n_for_d <- function(n, p, target) if (max(p) < target) NA_real_ else
+  if (min(p) >= target) min(n) else approx(p, n, xout = target, ties = "ordered")$y
+sizing_d %>% group_by(game, outcome, test) %>%
+  summarise(N_80 = n_for_d(N_total, power, 0.8), N_90 = n_for_d(N_total, power, 0.9),
+            .groups = "drop") %>%
+  knitr::kable(digits = 0)
+```
+
+```{r c5-fig-sim-sizing, fig.width=10, fig.height=7, dpi=300, fig.retina=1}
+orig_n <- data.frame(game = factor(levels(dt$game), levels(dt$game)), n = as.numeric(table(dt$game)))
+p_sizing_d <- ggplot(sizing_d, aes(N_total, power, colour = test)) +
+  geom_hline(yintercept = c(0.8, 0.9), linetype = "dashed", colour = "gray50") +
+  geom_vline(data = orig_n, aes(xintercept = n), linetype = "dotdash", colour = "gray30") +
+  geom_line(linewidth = 0.9) + geom_point(size = 1.5) +
+  facet_grid(outcome ~ game) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Total number of allocators", y = "Power at α = 0.05", colour = NULL) +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+p_sizing_d
+```
+
+**Interpretation of the simulation.** Under the pooled null hypothesis, the OLS and the Wilcoxon test with normal approximation hold their nominal level in all four cases. The OLS with robust standard errors is thus not too liberal, even with 15 allocators per group and a binary outcome. The exact test, by contrast, is conservative for the binary *Is Corrupt*: in the Basic Game, it rejects a true null hypothesis in only 1.7% of the replications, because only few p-values can be attained. The gap between $p = 0.019$ and $p = 0.050$ therefore does not show that the OLS overstates the evidence, but that the exact test understates it. For the ten-category *%-Corrupt*, the exact test holds its level. For *Is Corrupt*, all power curves are smooth, because the shift of the probability keeps the values at 0 and 1. For *%-Corrupt*, the OLS curves are smooth, but the Wilcoxon curves move in steps: as explained in Section 3.5 of the thesis, the shift breaks the ties between the ten answer categories. The power at the observed effect and the sample-size simulation are therefore used for the comparison. With the effect of the Basic Game, the OLS reaches 80% power for *Is Corrupt* with about 38 allocators, the approximate Wilcoxon test with about 40 and the exact test with about 48; for *%-Corrupt*, the OLS needs about 70 allocators and the Wilcoxon test about 96, i.e. about 1.4 times as many. With the effects of the Modified Game, all tests need about 50–57 allocators.
+
+## Interpretation
+
+All procedures point in the direction reported by Di Tella et al. (2015): allocators who can take more tokens are more likely to believe that sellers acted unkindly. How strong the evidence is depends on the experiment and on the test. The comparison yields four insights.
+
+- **In the Modified Game, the choice of test does not matter.** With 65 allocators, all tests reject clearly, hold their level and have about the same power, because the treatment shifts the whole distribution of beliefs, which the mean and the ranks capture equally well. Only the residual test loses the effect on *Is Corrupt*, which reflects a weakness of residualising a binary outcome rather than evidence against the effect.
+- **In the Basic Game, the result for *Is Corrupt* depends on whether the test is exact, and the exact test is too conservative.** With 15 allocators per group and a binary answer, the exact test can attain only a few p-values, and the observed data give exactly $p = 0.050$. The OLS and the approximate Wilcoxon test hold their level, so their p-values are not overstated; the exact test understates the evidence. With small samples and binary outcomes, exactness alone does not make a test better.
+- **For *%-Corrupt* in the Basic Game, the rank test is less powerful than the regression.** As in Case 4, the difference rests largely on a few distant answers, which the mean weighs heavily and the ranks only record as lower, and the belief takes only ten values, so most answers are tied. The usual advantage of rank tests does not apply either, because the bounded scale has no outliers against which the mean would need protection.
+- **As in Cases 2 and 4, the power curves of the rank test reflect the data-generating process.** With only ten answer categories, the Wilcoxon curves for *%-Corrupt* move in steps. For the binary *Is Corrupt*, shifting the probability instead of the answers keeps the values at 0 and 1 and yields smooth curves.
+
+Overall, the case shows that the authors' OLS is a valid choice for these data, but the rank-based analysis reveals how thin part of the evidence is. In the small Basic Game, the effect on the share of corrupt sellers is not significant with the rank test and only at the 10% level with the OLS, and the effect on the binary belief sits exactly at the 5% threshold with the exact test; the simulation shows that the Basic Game was underpowered for both beliefs. Only the larger Modified Game provides robust evidence. A conceptual replication with a larger sample did not reproduce the main findings (Verrina 2023). With small samples and few possible answers, the choice between an exact and an approximate test can decide whether a result counts as significant, and a result that depends on this choice should be treated with caution.

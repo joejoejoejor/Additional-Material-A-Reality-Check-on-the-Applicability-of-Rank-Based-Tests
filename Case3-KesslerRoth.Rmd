@@ -1,0 +1,877 @@
+---
+title: "Case 3: Kessler & Roth (2012)"
+subtitle: "Organ allocation policy and the decision to donate"
+author: "Johannes Valentin Solibieda"
+date: "November 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Figures used in the thesis: the chunk option fig.process = thesis_fig("caseN-name")
+# (together with dpi = 300, fig.retina = 1) copies the chunk's figure to ../Thesis/figures.
+thesis_fig <- function(name) function(path) {
+  file.copy(path, file.path("../Thesis/figures", paste0(name, ".png")), overwrite = TRUE)
+  path
+}
+```
+
+**Study:** Kessler, J. B. and Roth, A. E. (2012). Organ Allocation Policy and the Decision to Donate. *American Economic Review* 102(5): 2018–2047. <https://doi.org/10.1257/aer.102.5.2018>
+
+**Data:** `Kessler & Roth 2012/Original/` (original data and analysis files of the authors).
+
+This file reproduces all results, tables and figures of Case 3 (Section 4.3 of the thesis). It is self-contained: it reads the original data and defines every helper it uses. As in the thesis, the two research hypotheses are treated one after the other, each with its own diagnostics, test choice and results.
+
+## Original study and research hypotheses
+
+Kessler and Roth (2012) study whether giving registered organ donors priority on the waiting list increases donor registration. Subjects play a stylised organ-donation game in fixed groups of 12. Each subject starts every round with one "A unit" (the head) and two "B units" (the kidneys). In each period, the A unit fails with probability 10% (death) and each B unit with probability 20%. A subject without working B units has five periods to receive one from a deceased donor; otherwise they die. As long as a subject is alive, they earn \$1 per period. At the beginning of every round, subjects decide whether to register as donors, which costs \$0.40 or \$0.80 (six low-cost and six high-cost subjects per group). Registered donors give their remaining B units to waiting subjects when they die.
+
+Each group plays 15 rounds in one condition and then 16 rounds in another:
+
+| Condition | Rule |
+|---|---|
+| Control | B units go to those who have waited longest |
+| Priority | registered donors are served first |
+| Rebate | donors receive a rebate that replicates the expected financial value of priority, without changing the allocation |
+| Discount | registration is \$0.35 cheaper |
+
+Every group plays the control condition in one of the two halves (Table 2 of the paper): 20 groups start in Control (3 stay in Control, 8 switch to Priority, 4 to Discount, 5 to Rebate), and 4 groups each start in Priority, Discount or Rebate and switch to Control.
+
+The case study covers the two main results of the paper:
+
+> **RH1:** The priority rule increases the donor registration rate.
+>
+> **RH2:** Without prior learning effects, the conditions are ordered according to how directly subjects experience the incentive to register: Priority > Discount > Rebate ≥ Control.
+
+The authors test RH1 with linear probability models of `donate` on condition dummies, with standard errors clustered by subject (Table 3), and RH2 with a probit model over the first 15 rounds, again clustered by subject, followed by Wald tests that compare adjacent conditions (footnote 21).
+
+```{r c3-setup, message=FALSE, warning=FALSE}
+library(haven); library(dplyr); library(tidyr); library(ggplot2); library(patchwork)
+library(lmtest); library(sandwich)
+library(coin)        # exact rank tests with ties
+
+kr <- read_dta("Kessler & Roth 2012/Original/kessler_roth_data.dta") %>%
+  filter(period == 1) %>%                     # one donation decision per subject and round
+  mutate(gid  = paste(session, group, sep = "_"),
+         half = ifelse(play < 16, "Rounds 1-15", "Rounds 16-31"),
+         cond = factor(game, 1:4, c("Control", "Priority", "Discount", "Rebate")))
+
+c(subjects = n_distinct(kr$u_subject), groups = n_distinct(kr$gid), rounds = max(kr$play))
+```
+
+## RH1: Priority rule
+
+### Data diagnostics and fit of the original analysis: priority rule
+
+```{r c3-fig-rounds, fig.width=9, fig.height=4.5, dpi=300, fig.retina=1, fig.process=thesis_fig("case3-share-by-round")}
+kr %>% group_by(play, half, cond) %>% summarise(rate = mean(donate), .groups = "drop") %>%
+  ggplot(aes(play, rate, colour = cond, group = interaction(cond, half))) +
+  geom_line(linewidth = 0.9) + geom_point(size = 1.2) +
+  geom_vline(xintercept = 15.5, linetype = "dashed", colour = "gray50") +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Round", y = "Share registered as donor", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+```
+
+Donation decisions are made by individuals, but individuals are not independent observations. Each subject decides 31 times, and the 12 members of a group share one pool of B units, so the outcome of one member's decision affects the payoffs and experiences of the others. Groups never interact, so the group is the smallest unit that is independent by design. The rank-based analysis below therefore aggregates donation decisions to one registration rate per group and half of the game.
+
+```{r c3-group-rates}
+grp <- kr %>%
+  group_by(gid, half) %>%
+  summarise(rate = mean(donate), cond = first(cond), .groups = "drop") %>%
+  pivot_wider(names_from = half, values_from = c(rate, cond)) %>%
+  rename(rate1 = `rate_Rounds 1-15`, rate2 = `rate_Rounds 16-31`,
+         cond1 = `cond_Rounds 1-15`, cond2 = `cond_Rounds 16-31`) %>%
+  mutate(sequence = paste(cond1, "→", cond2))
+
+grp %>% group_by(sequence) %>%
+  summarise(groups = n(), rate_1_15 = mean(rate1), rate_16_31 = mean(rate2), .groups = "drop") %>%
+  knitr::kable(digits = 3)
+```
+
+```{r c3-fig-groups, fig.width=9, fig.height=4.5, dpi=300, fig.retina=1, fig.process=thesis_fig("case3-group-rates")}
+grp_long <- bind_rows(
+  grp %>% transmute(gid, half = "Rounds 1-15", cond = cond1, rate = rate1),
+  grp %>% transmute(gid, half = "Rounds 16-31", cond = cond2, rate = rate2))
+
+ggplot(grp_long, aes(cond, rate, colour = cond)) +
+  geom_jitter(width = 0.12, height = 0, size = 2.2, alpha = 0.8) +
+  stat_summary(fun = median, geom = "crossbar", width = 0.5, colour = "black", linewidth = 0.3) +
+  facet_wrap(~ half) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = NULL, y = "Group registration rate") +
+  theme_minimal(base_size = 12) + theme(legend.position = "none")
+```
+
+```{r c3-icc}
+subj <- kr %>% filter(play < 16) %>%
+  group_by(u_subject, gid, cond) %>% summarise(rate = mean(donate), .groups = "drop")
+anova(lm(rate ~ cond + gid, data = subj))   # group effect beyond the condition
+```
+
+**Unit of analysis.** The authors cluster standard errors by subject, which accounts for the repeated decisions of each subject but treats the 384 subjects as independent. Subjects in the same group are not independent by design, because they share the pool of B units. In the data, the remaining group-to-group variation within a condition is small (the group effect in the subject-level ANOVA is not significant, p = 0.37), so the subject-level analysis is not grossly misleading. Independence across groups, however, is guaranteed by the design, independence within groups is not. A test that relies only on what the design guarantees has to treat the group as the unit.
+
+**Few independent units.** At the group level, the experiment consists of only 32 observations per half, distributed very unevenly: in the first 15 rounds, 20 groups played Control and 4 groups each played Priority, Discount and Rebate. With so few units, normal approximations are unreliable and asymptotic cluster-robust standard errors are questionable. Exact permutation distributions are available and should be used.
+
+**Minimum attainable p-values.** With few units, an exact rank test cannot produce arbitrarily small p-values. With 4 against 4 groups, there are only $\binom{8}{4} = 70$ possible rank configurations, so the smallest two-sided p-value is $2/70 = 0.029$. With 8 against 3 groups it is $2/\binom{11}{3} = 0.012$. This limit is a property of the design, not of the test: it shows how much independent information the experiment actually contains.
+
+**Outcome.** Group registration rates are averages of 180 (12 × 15) or 192 (12 × 16) binary decisions. They are bounded between 0 and 1 and take almost continuous values, so ties are rare.
+
+**Time and order effects.** The conditions are varied both between groups and, through the switch after round 15, within groups, and registration declines over the rounds. The authors' main specification (Table 3, column 1) pools all 31 rounds and thereby mixes comparisons between and within groups with this decline over time. Column 2 of Table 3 adds a second-half dummy and its interactions with the conditions.
+
+### Test choice and justification: priority rule
+
+The diagnostics show that the group is the independent unit, that there are only few groups per condition, and that time and order effects overlap with the treatment. Following the decision table of the thesis (Section 3.4), the tests are therefore applied to one value per group, computed exactly, and designed to separate the treatment from time effects. RH1 is tested at the group level with one registration rate per group and half, in two complementary designs:
+
+1. **Difference-in-differences (Wilcoxon rank-sum).** For the 8 groups that switch from Control to Priority and the 3 groups that stay in Control, the change in the registration rate from the first to the second half is computed. The two sets of changes are compared with an exact Wilcoxon rank-sum test. The always-Control groups remove the time trend (learning, restart effects) that would otherwise be attributed to the priority rule.
+2. **Between groups in the first half (Wilcoxon rank-sum).** The first-half rates of the 4 Priority groups are compared with those of the 20 Control groups. This comparison is free of order effects, as all groups are inexperienced.
+
+Effect sizes are Hodges–Lehmann estimates with exact confidence intervals.
+
+### Results: priority rule
+
+#### Replication of the original analysis
+
+```{r c3-ols}
+m_ols <- lm(donate ~ lifesharers + rebate + decreasecost, data = kr)
+ols_tab <- rbind(
+  "SE clustered by subject" = coeftest(m_ols, vcov = vcovCL(m_ols, cluster = ~ u_subject, type = "HC1"))["lifesharers", ],
+  "SE clustered by group"   = coeftest(m_ols, vcov = vcovCL(m_ols, cluster = ~ gid,       type = "HC1"))["lifesharers", ])
+knitr::kable(ols_tab, digits = 4)
+```
+
+The priority coefficient reproduces Table 3 (0.306, SE 0.029): registration is about 31 percentage points higher under the priority rule. Clustering at the group level, the level at which observations are actually independent, increases the standard error by half (0.044), but the effect remains highly significant.
+
+#### Rank-based tests
+
+```{r c3-h1}
+cp <- filter(grp, cond1 == "Control", cond2 == "Priority")
+cc <- filter(grp, cond1 == "Control", cond2 == "Control")
+
+h1_did <- wilcox.test(cp$rate2 - cp$rate1, cc$rate2 - cc$rate1, conf.int = TRUE, exact = TRUE)
+
+first <- grp %>% filter(cond1 %in% c("Priority", "Control")) %>% mutate(cond1 = droplevels(cond1))
+h1_btw_p  <- pvalue(wilcox_test(rate1 ~ factor(cond1, levels = c("Priority", "Control")),
+                                data = first, distribution = "exact"))
+h1_btw_hl <- wilcox.test(first$rate1[first$cond1 == "Priority"],
+                         first$rate1[first$cond1 == "Control"], conf.int = TRUE, exact = FALSE)
+
+data.frame(
+  design = c("Difference-in-differences (8 vs 3 groups)",
+             "First half, Priority vs Control (4 vs 20 groups)"),
+  HL_effect = c(h1_did$estimate, h1_btw_hl$estimate),
+  ci_low    = c(h1_did$conf.int[1], h1_btw_hl$conf.int[1]),
+  ci_high   = c(h1_did$conf.int[2], h1_btw_hl$conf.int[2]),
+  p_exact   = c(h1_did$p.value, as.numeric(h1_btw_p)),
+  p_minimum = c(2 / choose(11, 3), 2 / choose(24, 4))) %>%
+  knitr::kable(digits = 4)
+
+# changes in the three always-Control groups (time trend)
+round(cc$rate2 - cc$rate1, 3)
+```
+
+Both group-level designs confirm RH1, and they do so as clearly as the design allows. In the difference-in-differences comparison, every one of the 8 switching groups increases its registration rate by more than any of the 3 always-Control groups; the exact p-value of 0.012 is the smallest attainable with 8 and 3 groups. In the first half, all 4 Priority groups register more often than all 20 Control groups (exact p = 0.0002). The Hodges–Lehmann effects are 26 percentage points (difference-in-differences) and 38 points (first half). The difference-in-differences estimate already accounts for the time trend, since registration in the always-Control groups tends to fall over time.
+
+#### Brunner–Munzel check
+
+The Wilcoxon test is exact only when both groups have the same distribution. The Brunner–Munzel test drops this assumption (Brunner and Munzel 2000); its p-value is obtained from a studentised permutation test (Neubert and Brunner 2007). The thesis states in a footnote (Section 4.5) that the test was applied in all cases and did not change any conclusion; this section documents the check for Case 3. With so few groups, only the permutation p-value is meaningful.
+
+```{r c3-bm-helpers}
+# Brunner-Munzel statistic for the relative effect p = P(a < b) + 0.5 P(a = b)
+bm <- function(a, b) {
+  na <- length(a); nb <- length(b); N <- na + nb
+  r  <- rank(c(a, b)); ra <- r[seq_len(na)]; rb <- r[-seq_len(na)]
+  ma <- mean(ra); mb <- mean(rb)
+  sa <- sum((ra - rank(a) - ma + (na + 1) / 2)^2) / (na - 1)
+  sb <- sum((rb - rank(b) - mb + (nb + 1) / 2)^2) / (nb - 1)
+  V  <- na * sa + nb * sb
+  list(W    = if (V == 0) sign(mb - ma) * Inf else na * nb * (mb - ma) / (N * sqrt(V)),
+       df   = if (V == 0) NA_real_ else V^2 / ((na * sa)^2 / (na - 1) + (nb * sb)^2 / (nb - 1)),
+       phat = (mb - (nb + 1) / 2) / na)
+}
+# Two-sided studentised permutation p-value and t-approximation
+bm_test <- function(a, b, B = 1e4, seed = 1) {
+  s <- bm(a, b); v <- c(a, b); na <- length(a)
+  set.seed(seed)
+  W_perm <- replicate(B, { i <- sample.int(length(v), na); bm(v[i], v[-i])$W })
+  c(phat = s$phat,
+    p_bm_permutation = (1 + sum(abs(W_perm) >= abs(s$W) - 1e-10)) / (B + 1),
+    p_bm_t = if (is.finite(s$W)) 2 * pt(-abs(s$W), s$df) else NA)
+}
+```
+
+```{r c3-bm-rh1, cache=TRUE}
+rbind(
+  "Difference-in-differences (3 vs 8 groups)" =
+    c(p_wilcoxon = h1_did$p.value, bm_test(cc$rate2 - cc$rate1, cp$rate2 - cp$rate1)),
+  "First half, Control vs Priority (20 vs 4 groups)" =
+    c(p_wilcoxon = as.numeric(h1_btw_p),
+      bm_test(first$rate1[first$cond1 == "Control"], first$rate1[first$cond1 == "Priority"]))) %>%
+  knitr::kable(digits = 4)
+```
+
+The Brunner–Munzel test reaches the same conclusion as the exact Wilcoxon test in both designs.
+
+#### Resampling simulations
+
+The simulation for RH1 compares the authors' pooled regression (Table 3, column 1, standard errors clustered by subject) with the two group-level Wilcoxon designs. It keeps the subject level, so that the authors' regression can be run as in the paper, but always resamples *whole groups* (all 12 subjects, both halves), and every simulated data set has the design of the experiment (3 Control→Control, 8 Control→Priority, 4 Control→Discount, 5 Control→Rebate and 4 groups each of Priority/Discount/Rebate→Control), scaled by $\lambda$ for the sample-size simulation. All simulations for RH1 work with one registration rate per subject and half instead of the individual decisions; this changes nothing for the authors' regression (see the check in the helper chunk).
+
+**Size under the pooled null hypothesis.** For every slot of the design, a donor group is drawn from *all* 32 groups and used as it is. The conditions are thus assigned independently of the outcomes, so $H_0$ holds exactly, while the dependence within groups and the time pattern are preserved.
+
+**Data-generating process for the power.**
+
+1. *Isolate the effect.* $\hat m_{c,h}$ is the mean group registration rate of condition $c$ in half $h$; the observed priority effect in half $h$ is $\hat\theta_h = \hat m_{P,h} - \hat m_{C,h}$.
+2. *Remove it and re-add it with strength $s$.* Each simulated group takes a donor group and shifts the rates of its subjects from the donor's cell mean to the target: control stays at $\hat m_{C,h}$, priority is moved to $\hat m_{C,h} + s\,\hat\theta_h$, discount and rebate keep their observed distance to control.
+3. *Cap.* Shifted subject rates are truncated to $[0, 1]$, and the realised effect is recorded.
+4. *Draw donors in two ways.* **Standard bootstrap:** donors only from groups with the same sequence of conditions (e.g. only from the 3 always-Control groups). **Pooled residual bootstrap** (Section 3.5 of the thesis): donors from all 32 groups, re-centred on the target, i.e. target level plus the donor's deviation from its own cell mean. This uses the variation of all groups instead of 3 or 4 values and assumes that groups scatter similarly around their cell mean in every condition.
+
+Only the strength of the priority effect is varied; the time pattern of the data (registration falls from the first to the second half) is kept as observed. A time effect could be varied as well, since it would affect the pooled regression but not the group-level designs. This is not pursued here: it would make the simulation considerably more complex, and the authors address the time effect themselves in Table 3, column 2, which adds a second-half dummy and in which the priority effect remains large.
+
+```{r c3-sim-params, cache=TRUE}
+# ---- Parameters (change here) ---------------------------------------------
+s_grid_k   <- seq(0, 1, by = 0.05)                 # target strength of the priority effect
+lam_max_k  <- 1                                   # largest scaling of the number of groups
+B_size_k   <- 5000                                 # replications for the pooled size check
+B_k        <- 1000                                 # replications per point otherwise
+alpha_k    <- 0.05
+```
+
+```{r c3-sim-helpers}
+# subject-half data: one rate per subject and half, weighted by the number of rounds
+sh <- kr %>% group_by(gid, u_subject, h = ifelse(play < 16, 1, 2)) %>%
+  summarise(y = mean(donate), w = n(), cond = as.character(first(cond)), .groups = "drop")
+
+# Authors' OLS (Table 3, col. 1) on subject-half rates with round weights.
+# Coefficients and subject-clustered CR1 standard errors are identical to the
+# regression on the 11,904 individual decisions, because the regressors are
+# constant within a subject and half.
+ols_fast <- function(y, w, cond, subj) {
+  X <- cbind(1, cond == "Priority", cond == "Rebate", cond == "Discount")
+  XtW <- t(X * w); A <- solve(XtW %*% X); b <- A %*% (XtW %*% y)
+  e <- y - X %*% b
+  S <- rowsum(X * as.vector(w * e), subj)
+  G <- nrow(S); N <- sum(w); K <- ncol(X)
+  V <- (G / (G - 1)) * ((N - 1) / (N - K)) * A %*% crossprod(S) %*% A
+  c(b = b[2], p = 2 * pt(-abs(b[2] / sqrt(V[2, 2])), G - 1))
+}
+ols_fast(sh$y, sh$w, sh$cond, sh$u_subject)   # check: 0.3057 as in Table 3
+
+donors <- sh %>% arrange(gid, u_subject, h) %>% group_by(gid) %>%
+  summarise(c1 = cond[h == 1][1], c2 = cond[h == 2][1],
+            Y = list(matrix(y, ncol = 2, byrow = TRUE)),
+            W = list(c(w[h == 1][1], w[h == 2][1])), .groups = "drop") %>%
+  mutate(seq = paste(c1, c2, sep = "-"))
+seq_n <- table(donors$seq)
+cell_mean <- sh %>% group_by(gid, h) %>% summarise(r = mean(y), cond = first(cond), .groups = "drop") %>%
+  group_by(cond, h) %>% summarise(m = mean(r), .groups = "drop") %>%
+  { tapply(.$m, list(.$cond, .$h), mean) }
+theta_obs <- cell_mean["Priority", ] - cell_mean["Control", ]   # observed priority effect per half
+
+target_mean <- function(s) {
+  L <- cell_mean
+  L["Priority", ] <- cell_mean["Control", ] + s * theta_obs
+  L
+}
+n_design <- function(lam) setNames(pmax(1, round(lam * as.numeric(seq_n))), names(seq_n))
+
+# H0: donors from all 32 groups, used as they are
+sim_pooled <- function(lam = 1) {
+  out <- list(); nd <- n_design(lam)
+  for (q in names(nd)) {
+    cq <- strsplit(q, "-")[[1]]
+    for (dg in sample.int(nrow(donors), nd[[q]], replace = TRUE))
+      out[[length(out) + 1]] <- list(Y = donors$Y[[dg]], W = donors$W[[dg]], c1 = cq[1], c2 = cq[2])
+  }
+  out
+}
+
+# HA: shift subject rates from the donor's cell mean to the target, cap to [0, 1]
+sim_shift <- function(s, lam = 1, pooled = FALSE) {
+  L <- target_mean(s); out <- list(); nd <- n_design(lam)
+  for (q in names(nd)) {
+    cq <- strsplit(q, "-")[[1]]
+    pool <- if (pooled) seq_len(nrow(donors)) else which(donors$seq == q)
+    for (dg in pool[sample.int(length(pool), nd[[q]], replace = TRUE)]) {
+      Y <- donors$Y[[dg]]
+      Y[, 1] <- pmin(pmax(Y[, 1] - cell_mean[donors$c1[dg], 1] + L[cq[1], 1], 0), 1)
+      Y[, 2] <- pmin(pmax(Y[, 2] - cell_mean[donors$c2[dg], 2] + L[cq[2], 2], 0), 1)
+      out[[length(out) + 1]] <- list(Y = Y, W = donors$W[[dg]], c1 = cq[1], c2 = cq[2])
+    }
+  }
+  out
+}
+
+# p-values of the three tests and the realised priority effect (relative to the observed one)
+tests_h1 <- function(D) {
+  n  <- length(D); m <- sapply(D, function(g) nrow(g$Y))
+  y  <- unlist(lapply(D, function(g) c(g$Y[, 1], g$Y[, 2])))
+  w  <- unlist(lapply(D, function(g) rep(g$W, each = nrow(g$Y))))
+  cd <- unlist(lapply(D, function(g) rep(c(g$c1, g$c2), each = nrow(g$Y))))
+  sj <- unlist(lapply(seq_len(n), function(i) rep(paste(i, seq_len(m[i])), 2)))
+  o  <- ols_fast(y, w, cd, sj)
+  r1 <- sapply(D, function(g) mean(g$Y[, 1])); r2 <- sapply(D, function(g) mean(g$Y[, 2]))
+  c1 <- sapply(D, `[[`, "c1"); c2 <- sapply(D, `[[`, "c2")
+  cp <- c1 == "Control" & c2 == "Priority"; cc <- c1 == "Control" & c2 == "Control"
+  th <- c(mean(r1[c1 == "Priority"]) - mean(r1[c1 == "Control"]),
+          mean(r2[c2 == "Priority"]) - mean(r2[c2 == "Control"]))
+  c(ols   = unname(o["p"]),
+    did   = suppressWarnings(wilcox.test((r2 - r1)[cp], (r2 - r1)[cc])$p.value),
+    first = suppressWarnings(wilcox.test(r1[c1 == "Priority"], r1[c1 == "Control"])$p.value),
+    s_real = mean(th / theta_obs))
+}
+lab_k <- c(ols = "OLS, subject-clustered (paper)", did = "Wilcoxon, difference-in-differences",
+           first = "Wilcoxon, first half")
+boot_lab <- c(`FALSE` = "Standard bootstrap", `TRUE` = "Pooled residual bootstrap")
+```
+
+**Size under the pooled null hypothesis.**
+
+```{r c3-sim-size, cache=TRUE, dependson="c3-sim-params"}
+set.seed(21)
+r0 <- t(replicate(B_size_k, tests_h1(sim_pooled())))
+size_k <- data.frame(test = unname(lab_k), size = colMeans(r0[, 1:3] < alpha_k),
+                     mc_se = sqrt(colMeans(r0[, 1:3] < alpha_k) * (1 - colMeans(r0[, 1:3] < alpha_k)) / B_size_k))
+knitr::kable(size_k, digits = 4, row.names = FALSE)
+```
+
+**Power curves (target and realised effect).**
+
+```{r c3-sim-curves, cache=TRUE, dependson="c3-sim-params"}
+curves_k <- bind_rows(lapply(c(FALSE, TRUE), function(pl) {
+  set.seed(23)
+  bind_rows(lapply(s_grid_k, function(sv) {
+    r <- t(replicate(B_k, tests_h1(sim_shift(sv, pooled = pl))))
+    data.frame(bootstrap = unname(boot_lab[as.character(pl)]), s = sv, s_real = mean(r[, "s_real"]),
+               test = unname(lab_k), power = colMeans(r[, 1:3] < alpha_k), n_sim = B_k)
+  }))
+})) %>%
+  mutate(test = factor(test, lab_k), bootstrap = factor(bootstrap, boot_lab),
+         se = sqrt(power * (1 - power) / n_sim))
+
+curves_k %>% filter(s %in% c(0, 0.25, 0.5, 0.75, 1)) %>%
+  select(bootstrap, s, s_real, test, power) %>%
+  pivot_wider(names_from = test, values_from = power) %>% knitr::kable(digits = 3)
+```
+
+```{r c3-fig-sim-curves, fig.width=10, fig.height=7, dpi=300, fig.retina=1, fig.process=thesis_fig("case3-h1-power-full")}
+curves_k %>%
+  pivot_longer(c(s, s_real), names_to = "axis", values_to = "x") %>%
+  mutate(axis = factor(axis, c("s", "s_real"),
+                       c("Target effect s", "Realised effect (share of observed)"))) %>%
+  ggplot(aes(x, power, colour = test)) +
+  geom_hline(yintercept = alpha_k, linetype = "dashed", colour = "gray50") +
+  geom_errorbar(aes(ymin = power - 1.96 * se, ymax = power + 1.96 * se), width = 0, alpha = 0.4) +
+  geom_line(linewidth = 0.9) + geom_point(size = 1.3) +
+  facet_grid(bootstrap ~ axis) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Strength of the priority effect (1 = observed)", y = "Rejection rate at α = 0.05", colour = NULL) +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+```
+
+```{r c3-fig-sim-curves-realised, fig.width=10, fig.height=4.5, dpi=300, fig.retina=1, fig.process=thesis_fig("case3-h1-power")}
+# Thesis main text: realised effect only (target and realised together: case3-h1-power-full, appendix)
+curves_k %>%
+  ggplot(aes(s_real, power, colour = test)) +
+  geom_hline(yintercept = alpha_k, linetype = "dashed", colour = "gray50") +
+  geom_errorbar(aes(ymin = power - 1.96 * se, ymax = power + 1.96 * se), width = 0, alpha = 0.4) +
+  geom_line(linewidth = 0.9) + geom_point(size = 1.3) +
+  facet_wrap(~ bootstrap, nrow = 1) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Realised priority effect (share of observed)", y = "Rejection rate at α = 0.05", colour = NULL) +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+```
+
+**Required number of groups.** The priority effect is held at its observed size ($s = 1$) and the number of groups of every sequence is scaled by $\lambda$, $n_q(\lambda) = \max\{1, \mathrm{round}(\lambda n_q)\}$. Because the original numbers per sequence are small (3 to 8), many values of $\lambda$ lead to the same design after rounding. The simulation therefore uses every *distinct* design that arises for $\lambda \leq 1$, which gives 17 designs with 7 to 32 groups.
+
+```{r c3-sim-sizing, cache=TRUE, dependson="c3-sim-params"}
+# all distinct designs for lambda <= lam_max_k (one representative lambda per design)
+lam_fine   <- seq(0.01, lam_max_k, by = 0.001)
+design_mat <- t(sapply(lam_fine, n_design))
+lam_grid_k <- lam_fine[!duplicated(design_mat)]
+
+sizing_k <- bind_rows(lapply(c(FALSE, TRUE), function(pl) bind_rows(lapply(lam_grid_k, function(lam) {
+  set.seed(24)
+  r <- t(replicate(B_k, tests_h1(sim_shift(1, lam = lam, pooled = pl))))
+  nd <- n_design(lam)
+  data.frame(bootstrap = unname(boot_lab[as.character(pl)]), lambda = lam, groups = sum(nd),
+             n_CP = nd[["Control-Priority"]], n_CC = nd[["Control-Control"]],
+             n_P1 = nd[["Priority-Control"]], test = unname(lab_k),
+             power = colMeans(r[, 1:3] < alpha_k), n_sim = B_k)
+})))) %>% mutate(test = factor(test, lab_k), bootstrap = factor(bootstrap, boot_lab))
+
+sizing_k %>% select(bootstrap, lambda, groups, n_CP, n_CC, n_P1, test, power) %>%
+  pivot_wider(names_from = test, values_from = power) %>% knitr::kable(digits = 3)
+```
+
+```{r c3-fig-sim-sizing, fig.width=10, fig.height=4.5, dpi=300, fig.retina=1, fig.process=thesis_fig("case3-h1-groups")}
+sizing_k %>% mutate(se = sqrt(power * (1 - power) / n_sim)) %>%
+  ggplot(aes(groups, power, colour = test)) +
+  geom_hline(yintercept = c(0.8, 0.9), linetype = "dashed", colour = "gray50") +
+  geom_vline(xintercept = 32, linetype = "dotdash", colour = "gray30") +
+  geom_line(linewidth = 0.4, alpha = 0.5, position = position_dodge(width = 0.6)) +
+  geom_point(size = 2, position = position_dodge(width = 0.6)) +
+  facet_wrap(~ bootstrap) +
+  scale_x_continuous(breaks = seq(8, 32, by = 4)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Total number of groups", y = "Power at α = 0.05", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+```
+
+**Interpretation of the simulation.**
+
+* *Size.* Under the pooled null hypothesis, both group-level Wilcoxon designs hold their level (difference-in-differences 3.3%, slightly conservative because of the minimum attainable p-value; first half 4.4%). The authors' regression rejects a true null hypothesis in 33% of the replications. Its standard errors, clustered by subject, treat the 12 members of a group as independent, although whole groups differ from each other; in addition, the pooled specification picks up the decline of registration over time, since priority slots lie mostly in the second half.
+* *Target vs realised effect.* Capping matters in opposite directions in the two bootstrap variants. In the standard bootstrap, priority groups are shifted down by up to 38 points to reach $s = 0$, many subjects hit the floor, and 12% of the observed effect remains even at $s = 0$. In the pooled residual bootstrap, donors are mostly control groups shifted *up*; capping at 1 then reduces the effect, so that only 87% of the observed effect is realised at $s = 1$.
+* *Standard vs pooled bootstrap.* The standard bootstrap resamples from only 3 always-Control and 4 first-half Priority groups. Its curves are erratic, and the first-half test hardly ever rejects for small effects. The pooled residual bootstrap gives smooth curves and is used for the interpretation.
+* *Power.* With the pooled residual bootstrap, the first-half Wilcoxon test reaches 80% power at about 40% of the observed effect, the difference-in-differences test at about 65%. The regression rejects more often for intermediate effects, but this advantage is not usable, since the same test rejects a true null in a third of the replications. Its rejection rate even falls from 17% at $s = 0$ to 5% at $s = 0.1$, because the decline over time pulls the pooled coefficient below zero, which a small true effect first offsets.
+* *Number of groups.* The curves are step functions, not smooth curves, for two reasons. First, the number of groups can only change in whole groups, and with 3 to 8 groups per sequence each additional group is a large step. Second, and more importantly, the observed effect is so large that the rank tests reject as soon as rejection is *possible at all*: an exact rank test with few groups has a smallest attainable p-value, and as long as it lies above 0.05, the test cannot reject however large the effect. The first-half comparison becomes able to reject with 2 priority groups (14 groups in total, minimum p = 2/45 = 0.044). The difference-in-differences design needs 3 always-Control and 7 switching groups (26 groups in total, minimum p = 2/120 = 0.017); with only 2 always-Control groups, even 7 switching groups give a minimum p-value of 2/36 = 0.056. The power of the rank tests therefore jumps from 0 to almost 1 at exactly these designs.
+* *The regression and the number of groups.* The authors' regression rejects at every number of groups, even in the smallest design with 7 groups. This is not a sign of high power but a consequence of the same underestimated standard errors that produce its size of 33% under the pooled null hypothesis: clustering by subject turns even 7 groups into 84 clusters. A sample-size statement for the regression is therefore not meaningful, because it would measure "power" that partly rests on miscalibrated standard errors.
+* *Time control and clustering by group.* Neither a time control nor clustering by group solves the size problem on its own; see the robustness section at the end of the results for RH2.
+
+## RH2: Ordering of the conditions
+
+### Data diagnostics and fit of the original analysis: ordering of the conditions
+
+RH2 uses only the first 15 rounds, in which every group plays one condition and no group has switched yet. The design therefore compares four independent sets of groups, 20 in Control and 4 each in Priority, Discount and Rebate. The dependence structure is the same as for RH1: the group, not the subject, is the unit that is independent by design, so at the group level there are only 4 observations per treatment condition.
+
+The authors test RH2 with a probit model clustered by subject and three pairwise Wald tests of the adjacent steps. The ordering is thus assembled from separate pairwise tests rather than tested as a whole, each step is judged at the 5% level without a correction for multiple testing, and the 48 subjects per treatment condition are treated as independent.
+
+### Test choice and justification: ordering of the conditions
+
+RH2 compares four independent sets of groups in the first 15 rounds and predicts an ordering. Three rank-based procedures fit:
+
+* the **Kruskal–Wallis test** as the omnibus test of whether the conditions differ at all;
+* the **Jonckheere–Terpstra test** for the ordered alternative Control ≤ Rebate ≤ Discount ≤ Priority (with at least one strict inequality), which tests the predicted ranking as a whole;
+* **pairwise Wilcoxon rank-sum tests** for the three adjacent comparisons the authors test (Priority vs Discount, Discount vs Rebate, Rebate vs Control), as the counterpart of their Wald tests.
+
+All p-values are exact or based on permutations, because the groups are few and unequal in size. To separate the effect of the method from the effect of the unit of analysis, the same rank tests are also applied at the subject level, using each subject's registration rate over rounds 1–15. This makes the same assumption as the authors' probit model (subjects are independent) and gives a like-for-like comparison with the parametric analysis.
+
+### Results: ordering of the conditions
+
+#### Replication of the original analysis
+
+```{r c3-probit}
+m_prob <- glm(donate ~ lifesharers + rebate + decreasecost,
+              family = binomial("probit"), data = filter(kr, play < 16))
+
+wald_p <- function(V, a, b = NULL) {
+  L <- setNames(rep(0, length(coef(m_prob))), names(coef(m_prob)))
+  L[a] <- 1; if (!is.null(b)) L[b] <- -1
+  z <- sum(L * coef(m_prob)) / sqrt(drop(t(L) %*% V %*% L))
+  2 * pnorm(-abs(z))
+}
+V_subj <- vcovCL(m_prob, cluster = ~ u_subject, type = "HC1")   # Stata CR1, as in the paper
+V_grp  <- vcovCL(m_prob, cluster = ~ gid,       type = "HC1")   # group clustering: only 4 groups per treatment
+cbind(se_subject = sqrt(diag(V_subj)), se_group = sqrt(diag(V_grp)))
+
+data.frame(comparison = c("Priority = Discount", "Discount = Rebate", "Rebate = Control"),
+           p_subject_cluster = c(wald_p(V_subj, "lifesharers", "decreasecost"),
+                                 wald_p(V_subj, "decreasecost", "rebate"),
+                                 wald_p(V_subj, "rebate")),
+           p_group_cluster   = c(wald_p(V_grp, "lifesharers", "decreasecost"),
+                                 wald_p(V_grp, "decreasecost", "rebate"),
+                                 wald_p(V_grp, "rebate"))) %>%
+  knitr::kable(digits = 4)
+```
+
+The Wald tests reproduce footnote 21 (Priority > Discount p = 0.015, Discount > Rebate p = 0.003, Rebate = Control p = 0.205).
+
+#### Rank-based tests at the group level
+
+```{r c3-h2, cache=TRUE}
+f1 <- grp %>% transmute(gid, cond = cond1, rate = rate1)
+f1 %>% group_by(cond) %>%
+  summarise(groups = n(), mean = mean(rate), median = median(rate),
+            min = min(rate), max = max(rate), .groups = "drop") %>%
+  knitr::kable(digits = 3)
+
+kw <- kruskal_test(rate ~ cond, data = f1, distribution = approximate(nresample = 1e5))
+
+# Jonckheere-Terpstra statistic for the order Control <= Rebate <= Discount <= Priority
+jt_stat <- function(x, g, ord) {
+  W <- 0
+  for (i in 1:(length(ord) - 1)) for (j in (i + 1):length(ord)) {
+    a <- x[g == ord[i]]; b <- x[g == ord[j]]
+    W <- W + sum(outer(a, b, "<")) + 0.5 * sum(outer(a, b, "=="))
+  }
+  W
+}
+ord <- c("Control", "Rebate", "Discount", "Priority")
+jt_obs <- jt_stat(f1$rate, f1$cond, ord)
+set.seed(1)
+jt_null <- replicate(1e5, jt_stat(f1$rate, sample(f1$cond), ord))
+jt_p <- (1 + sum(jt_null >= jt_obs)) / (1e5 + 1)
+
+pair_p <- function(a, b, alt = "two.sided") {
+  dd <- filter(f1, cond %in% c(a, b)) %>% mutate(cond = factor(cond, levels = c(a, b)))
+  pvalue(wilcox_test(rate ~ cond, data = dd, distribution = "exact", alternative = alt))
+}
+
+data.frame(
+  test = c("Kruskal-Wallis (any difference)",
+           "Jonckheere-Terpstra (Control ≤ Rebate ≤ Discount ≤ Priority)",
+           "Wilcoxon: Priority vs Discount", "Wilcoxon: Discount vs Rebate",
+           "Wilcoxon: Rebate vs Control"),
+  p_rank = c(as.numeric(pvalue(kw)), jt_p,
+             pair_p("Priority", "Discount"), pair_p("Discount", "Rebate"),
+             pair_p("Rebate", "Control")),
+  p_paper_wald = c(NA, NA, 0.015, 0.003, 0.205)) %>%
+  knitr::kable(digits = 4)
+
+# one-sided versions of the two adjacent comparisons the paper reports as significant
+c(priority_gt_discount = as.numeric(pair_p("Priority", "Discount", "greater")),
+  discount_gt_rebate   = as.numeric(pair_p("Discount", "Rebate", "greater")))
+```
+
+At the group level, the conditions clearly differ (Kruskal–Wallis, permutation p < 0.0001; the asymptotic chi-squared p-value of 0.0007 is conservative with groups of 4) and the predicted ordering as a whole is strongly supported (Jonckheere–Terpstra, permutation p < 0.0001). The group medians follow the predicted order exactly (Control 0.36, Rebate 0.38, Discount 0.61, Priority 0.75), so no amalgamation as in the Chacko–Shorack test is needed. The adjacent pairwise comparisons, however, do not resolve the ordering. Priority vs Discount (p = 0.057) and Discount vs Rebate (p = 0.11) are not significant at the 5% level, although the authors' subject-level Wald tests report p = 0.015 and p = 0.003. With 4 groups per condition, the smallest attainable two-sided p-value is 0.029; one group of Discount overlapping with Priority is enough to double it. Since RH2 is directional, one-sided tests are also justified: Priority > Discount then reaches p = 0.029, exactly the smallest attainable value, while Discount > Rebate remains insignificant (p = 0.057). Rebate = Control is supported by both approaches.
+
+**Same tests at the subject level.**
+
+```{r c3-h2-subject}
+s1 <- kr %>% filter(play < 16) %>%
+  group_by(u_subject, cond) %>% summarise(rate = mean(donate), .groups = "drop")
+table(s1$cond)
+
+# tie-corrected Jonckheere-Terpstra (normal approximation), order Control <= Rebate <= Discount <= Priority
+jt_norm <- function(x, g, ord) {
+  W <- jt_stat(x, g, ord)
+  n <- as.numeric(table(factor(g, ord))); N <- sum(n); t <- as.numeric(table(x))
+  E <- (N^2 - sum(n^2)) / 4
+  V <- (N * (N - 1) * (2 * N + 5) - sum(n * (n - 1) * (2 * n + 5)) -
+          sum(t * (t - 1) * (2 * t + 5))) / 72 +
+       sum(n * (n - 1) * (n - 2)) * sum(t * (t - 1) * (t - 2)) / (36 * N * (N - 1) * (N - 2)) +
+       sum(n * (n - 1)) * sum(t * (t - 1)) / (8 * N * (N - 1))
+  pnorm((W - E) / sqrt(V), lower.tail = FALSE)
+}
+pair_subj <- function(a, b)
+  wilcox.test(s1$rate[s1$cond == a], s1$rate[s1$cond == b], exact = FALSE)$p.value
+
+data.frame(
+  test = c("Kruskal-Wallis", "Jonckheere-Terpstra",
+           "Priority vs Discount", "Discount vs Rebate", "Rebate vs Control"),
+  p_group_level   = c(as.numeric(pvalue(kw)), jt_p,
+                      pair_p("Priority", "Discount"), pair_p("Discount", "Rebate"),
+                      pair_p("Rebate", "Control")),
+  p_subject_level = c(kruskal.test(rate ~ cond, data = s1)$p.value,
+                      jt_norm(s1$rate, s1$cond, ord),
+                      pair_subj("Priority", "Discount"), pair_subj("Discount", "Rebate"),
+                      pair_subj("Rebate", "Control")),
+  p_paper_probit  = c(NA, NA, 0.015, 0.003, 0.205)) %>%
+  knitr::kable(digits = 4)
+```
+
+At the subject level, the Wilcoxon tests reproduce the authors' Wald tests almost exactly (0.017, 0.003, 0.206 vs 0.015, 0.003, 0.205). The authors' probit has no controls beyond the treatment dummies, so both analyses compare the same average registration rates and differ only in what they count as an independent observation. The discrepancy between group and subject level is therefore caused by the unit of analysis, not by the method: the significance of the adjacent steps of the ordering rests on the assumption that subjects in the same group are independent. Since the conditions were assigned to groups, a test that respects this assignment can only permute whole groups; with 4 against 4 groups its p-value cannot fall below 0.029, however many subjects each group contains.
+
+#### Brunner–Munzel check
+
+```{r c3-bm-rh2, cache=TRUE}
+g1 <- function(cn) f1$rate[f1$cond == cn]
+rbind(
+  "Priority vs Discount" = c(p_wilcoxon = as.numeric(pair_p("Priority", "Discount")), bm_test(g1("Discount"), g1("Priority"))),
+  "Discount vs Rebate"   = c(p_wilcoxon = as.numeric(pair_p("Discount", "Rebate")),   bm_test(g1("Rebate"), g1("Discount"))),
+  "Rebate vs Control"    = c(p_wilcoxon = as.numeric(pair_p("Rebate", "Control")),    bm_test(g1("Control"), g1("Rebate")))) %>%
+  knitr::kable(digits = 4)
+```
+
+With 4 groups per condition, the $t$-approximation of the Brunner–Munzel test is unreliable; the permutation p-values agree with the exact Wilcoxon p-values and lead to the same conclusion.
+
+#### Resampling simulations
+
+The simulation for RH2 uses only the first 15 rounds, so there are no sequences of conditions and no time effect. Each of the 32 groups contributes one data set of 12 subjects; the design has 20 Control, 4 Priority, 4 Discount and 4 Rebate groups. Three families of tests are compared, and power is reported separately for the ordering as a whole and for its individual steps:
+
+* the authors' probit with standard errors clustered by subject and Wald tests for the adjacent steps (Priority = Discount, Discount = Rebate, Rebate = Control);
+* rank tests at the group level: Kruskal–Wallis and Jonckheere–Terpstra for the ordering as a whole, pairwise Wilcoxon tests for the steps;
+* pairwise Wilcoxon tests at the subject level (the third column of the table above).
+
+All pairwise tests are two-sided, as the authors' Wald tests; the Jonckheere–Terpstra test is one-sided by construction.
+
+For speed, the probit is estimated on subject-level registration rates as a binomial model with 15 trials per subject instead of on the 5,760 individual decisions. The coefficients are identical, and with one observation per subject the robust standard errors equal standard errors clustered by subject; on the original data the Wald p-values are 0.014, 0.003 and 0.205, as in footnote 21.
+
+**Size under the pooled null hypothesis.** All 32 slots are filled with first-half groups drawn from all 32 groups and used as they are.
+
+**Data-generating process for the power.** Control is the base. With $\hat m_c$ the mean group rate of condition $c$, every group is shifted from its donor's condition mean to the target $\hat m_C + s(\hat m_c - \hat m_C)$, so the shape of the ordering is kept (Rebate close to Control, Discount in between, Priority on top). Subject rates are capped to $[0, 1]$, and the realised effect (average of the realised distances to Control relative to the observed ones) is recorded. Donors are drawn either from groups of the same condition (standard bootstrap) or from all 32 groups and re-centred (pooled residual bootstrap).
+
+**Number of groups.** The number of groups per treatment condition is varied from 2 to 12, with five times as many Control groups, as in the original design (4 per treatment, 20 Control).
+
+```{r c3-rh2-sim-params, cache=TRUE}
+# ---- Parameters (change here) ---------------------------------------------
+s_grid_k2   <- seq(0, 1.5, by = 0.05)   # strength of the treatment effects (1 = observed)
+nT_grid_k2  <- 2:12                     # groups per treatment condition (Control: 5 times as many)
+B_size_k2   <- 5000
+B_k2        <- 1000
+alpha_k2    <- 0.05
+```
+
+```{r c3-rh2-sim-helpers}
+conds <- c("Control", "Priority", "Discount", "Rebate")
+d1 <- kr %>% filter(play < 16) %>%
+  group_by(gid, u_subject, cond) %>% summarise(y = mean(donate), .groups = "drop") %>%
+  mutate(cond = as.character(cond))
+donors2 <- d1 %>% group_by(gid) %>% summarise(cond = first(cond), Y = list(y), .groups = "drop")
+m_obs <- tapply(sapply(donors2$Y, mean), donors2$cond, mean)[conds]
+
+# probit on subject-level rates (binomial, 15 trials), robust = subject-clustered SE
+probit_wald <- function(y, cond, n = 15) {
+  X <- cbind(1, cond == "Priority", cond == "Discount", cond == "Rebate")
+  f <- suppressWarnings(glm.fit(X, y, weights = rep(n, length(y)), family = binomial("probit")))
+  b <- f$coefficients; eta <- drop(X %*% b)
+  mu <- pmin(pmax(pnorm(eta), 1e-10), 1 - 1e-10); dd <- dnorm(eta)
+  A  <- solve(crossprod(X * (n * dd^2 / (mu * (1 - mu))), X))
+  V  <- A %*% crossprod(X * (n * (y - mu) * dd / (mu * (1 - mu)))) %*% A
+  w  <- function(L) 2 * pnorm(-abs(sum(L * b) / sqrt(drop(t(L) %*% V %*% L))))
+  c(PD = w(c(0, 1, -1, 0)), DR = w(c(0, 0, 1, -1)), RC = w(c(0, 0, 0, 1)))
+}
+probit_wald(d1$y, d1$cond)   # check against footnote 21
+
+jt_p_norm <- function(x, g) {   # tie-corrected, order Control <= Rebate <= Discount <= Priority
+  ord <- c("Control", "Rebate", "Discount", "Priority")
+  W <- 0
+  for (i in 1:3) for (j in (i + 1):4) {
+    a <- x[g == ord[i]]; b <- x[g == ord[j]]
+    W <- W + sum(outer(a, b, "<")) + 0.5 * sum(outer(a, b, "=="))
+  }
+  n <- as.numeric(table(factor(g, ord))); N <- sum(n); t <- as.numeric(table(x))
+  E <- (N^2 - sum(n^2)) / 4
+  V <- (N * (N - 1) * (2 * N + 5) - sum(n * (n - 1) * (2 * n + 5)) - sum(t * (t - 1) * (2 * t + 5))) / 72 +
+       sum(n * (n - 1) * (n - 2)) * sum(t * (t - 1) * (t - 2)) / (36 * N * (N - 1) * (N - 2)) +
+       sum(n * (n - 1)) * sum(t * (t - 1)) / (8 * N * (N - 1))
+  pnorm((W - E) / sqrt(V), lower.tail = FALSE)
+}
+
+# one simulated first half: list of groups with condition and subject rates
+sim2_pooled <- function(nT = 4) {
+  slots <- c(rep("Control", 5 * nT), rep(c("Priority", "Discount", "Rebate"), each = nT))
+  lapply(slots, function(cc) list(cond = cc, y = donors2$Y[[sample.int(nrow(donors2), 1)]]))
+}
+sim2_shift <- function(s, nT = 4, pooled = FALSE) {
+  target <- m_obs["Control"] + s * (m_obs - m_obs["Control"])
+  slots <- c(rep("Control", 5 * nT), rep(c("Priority", "Discount", "Rebate"), each = nT))
+  lapply(slots, function(cc) {
+    pool <- if (pooled) seq_len(nrow(donors2)) else which(donors2$cond == cc)
+    dg <- pool[sample.int(length(pool), 1)]
+    list(cond = cc, y = pmin(pmax(donors2$Y[[dg]] - m_obs[donors2$cond[dg]] + target[cc], 0), 1))
+  })
+}
+
+tests_h2 <- function(D) {
+  gc <- sapply(D, `[[`, "cond"); gr <- sapply(D, function(g) mean(g$y))
+  sc <- unlist(lapply(D, function(g) rep(g$cond, length(g$y)))); sy <- unlist(lapply(D, `[[`, "y"))
+  pw <- function(x, g, a, b, exact) suppressWarnings(
+    wilcox.test(x[g == a], x[g == b], exact = exact)$p.value)
+  pr <- probit_wald(sy, sc)
+  real <- (tapply(gr, gc, mean)[conds] - mean(gr[gc == "Control"]))[-1] /
+          (m_obs - m_obs["Control"])[-1]
+  c(kw = kruskal.test(gr, factor(gc))$p.value, jt = jt_p_norm(gr, gc),
+    probit_PD = pr[["PD"]], probit_DR = pr[["DR"]], probit_RC = pr[["RC"]],
+    grp_PD = pw(gr, gc, "Priority", "Discount", TRUE), grp_DR = pw(gr, gc, "Discount", "Rebate", TRUE),
+    grp_RC = pw(gr, gc, "Rebate", "Control", FALSE),
+    subj_PD = pw(sy, sc, "Priority", "Discount", FALSE), subj_DR = pw(sy, sc, "Discount", "Rebate", FALSE),
+    subj_RC = pw(sy, sc, "Rebate", "Control", FALSE),
+    s_real = mean(real))
+}
+test_cols <- c("kw", "jt", "probit_PD", "grp_PD", "subj_PD", "probit_DR", "grp_DR", "subj_DR",
+               "probit_RC", "grp_RC", "subj_RC")
+lab_k2 <- c(kw = "Kruskal-Wallis (group)", jt = "Jonckheere-Terpstra (group)",
+            probit_PD = "Probit/Wald (paper)", grp_PD = "Wilcoxon, group level", subj_PD = "Wilcoxon, subject level",
+            probit_DR = "Probit/Wald (paper)", grp_DR = "Wilcoxon, group level", subj_DR = "Wilcoxon, subject level",
+            probit_RC = "Probit/Wald (paper)", grp_RC = "Wilcoxon, group level", subj_RC = "Wilcoxon, subject level")
+step_k2 <- c(kw = "Ordering as a whole", jt = "Ordering as a whole",
+             probit_PD = "Priority vs Discount", grp_PD = "Priority vs Discount", subj_PD = "Priority vs Discount",
+             probit_DR = "Discount vs Rebate", grp_DR = "Discount vs Rebate", subj_DR = "Discount vs Rebate",
+             probit_RC = "Rebate vs Control", grp_RC = "Rebate vs Control", subj_RC = "Rebate vs Control")
+tidy_rej <- function(r) data.frame(key = test_cols, comparison = step_k2[test_cols], test = lab_k2[test_cols],
+                                   rejection = colMeans(r[, test_cols] < alpha_k2), row.names = NULL)
+```
+
+**Size under the pooled null hypothesis.**
+
+```{r c3-rh2-sim-size, cache=TRUE, dependson="c3-rh2-sim-params"}
+set.seed(31)
+r0_2 <- t(replicate(B_size_k2, tests_h2(sim2_pooled())))
+size_k2 <- tidy_rej(r0_2) %>% mutate(mc_se = sqrt(rejection * (1 - rejection) / B_size_k2))
+knitr::kable(size_k2 %>% select(-key), digits = 3, row.names = FALSE)
+```
+
+**Power curves.**
+
+```{r c3-rh2-sim-curves, cache=TRUE, dependson="c3-rh2-sim-params"}
+curves_k2 <- bind_rows(lapply(c(FALSE, TRUE), function(pl) {
+  set.seed(32)
+  bind_rows(lapply(s_grid_k2, function(sv) {
+    r <- t(replicate(B_k2, tests_h2(sim2_shift(sv, pooled = pl))))
+    tidy_rej(r) %>% mutate(bootstrap = unname(boot_lab[as.character(pl)]), s = sv,
+                           s_real = mean(r[, "s_real"]), n_sim = B_k2)
+  }))
+})) %>% mutate(bootstrap = factor(bootstrap, boot_lab),
+               comparison = factor(comparison, c("Ordering as a whole", "Priority vs Discount",
+                                                 "Discount vs Rebate", "Rebate vs Control")),
+               se = sqrt(rejection * (1 - rejection) / n_sim))
+
+curves_k2 %>% filter(bootstrap == "Pooled residual bootstrap", s %in% c(0.5, 1, 1.5)) %>%
+  select(s, s_real, comparison, test, rejection) %>%
+  pivot_wider(names_from = s, values_from = c(rejection, s_real), names_glue = "{.value}_s{s}") %>%
+  knitr::kable(digits = 3)
+```
+
+```{r c3-rh2-fig-sim-curves, fig.width=11, fig.height=7, dpi=300, fig.retina=1, fig.process=thesis_fig("case3-h2-power")}
+curves_k2 %>% filter(comparison != "Rebate vs Control") %>%
+  ggplot(aes(s, rejection, colour = test)) +
+  geom_hline(yintercept = alpha_k2, linetype = "dashed", colour = "gray50") +
+  geom_vline(xintercept = 1, linetype = "dotted", colour = "gray40") +
+  geom_errorbar(aes(ymin = rejection - 1.96 * se, ymax = rejection + 1.96 * se), width = 0, alpha = 0.4) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.1) +
+  facet_grid(bootstrap ~ comparison) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Strength of the treatment effects s (1 = observed)",
+       y = "Rejection rate at α = 0.05", colour = NULL) +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+```
+
+**Number of groups.**
+
+```{r c3-rh2-sim-sizing, cache=TRUE, dependson="c3-rh2-sim-params"}
+sizing_k2 <- bind_rows(lapply(c(FALSE, TRUE), function(pl) {
+  set.seed(33)
+  bind_rows(lapply(nT_grid_k2, function(nT) {
+    r <- t(replicate(B_k2, tests_h2(sim2_shift(1, nT = nT, pooled = pl))))
+    tidy_rej(r) %>% mutate(bootstrap = unname(boot_lab[as.character(pl)]), groups_per_treatment = nT,
+                           groups_total = 8 * nT, n_sim = B_k2)
+  }))
+})) %>% mutate(bootstrap = factor(bootstrap, boot_lab),
+               comparison = factor(comparison, c("Ordering as a whole", "Priority vs Discount",
+                                                 "Discount vs Rebate", "Rebate vs Control")),
+               se = sqrt(rejection * (1 - rejection) / n_sim))
+
+sizing_k2 %>% filter(bootstrap == "Pooled residual bootstrap", comparison != "Rebate vs Control") %>%
+  select(groups_per_treatment, comparison, test, rejection) %>%
+  pivot_wider(names_from = groups_per_treatment, values_from = rejection, names_prefix = "nT=") %>%
+  knitr::kable(digits = 2)
+```
+
+```{r c3-rh2-fig-sim-sizing, fig.width=11, fig.height=7, dpi=300, fig.retina=1, fig.process=thesis_fig("case3-h2-groups")}
+sizing_k2 %>% filter(comparison != "Rebate vs Control") %>%
+  ggplot(aes(groups_per_treatment, rejection, colour = test)) +
+  geom_hline(yintercept = c(0.8, 0.9), linetype = "dashed", colour = "gray50") +
+  geom_vline(xintercept = 4, linetype = "dotdash", colour = "gray30") +
+  geom_errorbar(aes(ymin = rejection - 1.96 * se, ymax = rejection + 1.96 * se), width = 0, alpha = 0.4) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.5) +
+  facet_grid(bootstrap ~ comparison) +
+  scale_x_continuous(breaks = nT_grid_k2) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "Groups per treatment condition (Control: five times as many)",
+       y = "Power at α = 0.05", colour = NULL) +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+```
+
+**Interpretation of the RH2 simulation.**
+
+* *Size.* Under the pooled null hypothesis, all group-level rank tests hold their level (Kruskal–Wallis 4.1%, Jonckheere–Terpstra 5.2%, pairwise Wilcoxon 3.0–4.2%). The subject-level tests do not: the authors' probit Wald tests reject a true null in 26–28% of the replications, and the subject-level Wilcoxon tests in 25–27%. Both treat the 48 subjects per condition as independent, although the subjects of a group share their group's level. How much this matters depends on how strongly groups differ: in the pooled $H_0$ the observed treatment effects become differences between groups. With groups centred on their condition means (pooled residual bootstrap at $s = 0$), the subject-level tests hold their level (probit 3.5–5.2%, subject-level Wilcoxon 4.7–5.9%). They are valid only if groups of the same condition hardly differ, which appears to be the case in these data (group effect p = 0.37); the group-level tests are valid in both situations.
+* *Ordering as a whole.* Both group-level tests detect the ordering long before the observed effect size; the Jonckheere–Terpstra test, which uses the predicted direction, reaches 80% power at about 30% of the observed effect, the Kruskal–Wallis test at about 40%.
+* *Individual steps.* At the observed effect, the group-level Wilcoxon test detects Priority > Discount in only 26% and Discount > Rebate in 56% of the replications. This matches the insignificant group-level p-values in the data. The probit and subject-level tests reject more often (52% and 48% for Priority vs Discount), but this advantage is not usable, since they reject a true null in a quarter of the replications.
+* *Standard bootstrap and ties.* With only 4 donor groups per treatment, the standard bootstrap produces erratic curves. As explained in Section 3.5 of the thesis, the shift breaks the ties between subject rates, which are multiples of 1/15, so the subject-level Wilcoxon curves move in steps, for example at $s = 1$.
+* *Number of groups.* With 2 or 3 groups per treatment, the group-level pairwise tests cannot reject at all (smallest attainable p-values 0.33 and 0.10). To detect Priority > Discount with 80% power, about 10 groups per treatment are needed (80 groups in total instead of 32); for Discount > Rebate about 6 (48 groups). The ordering as a whole is detected reliably already with 2 groups per treatment.
+
+#### Robustness: time control and clustering by group (RH1 and RH2)
+
+The authors state that their results are "qualitatively the same" when standard errors are clustered at the group level (footnote 24 of the paper), and Table 3, column 2 adds a second-half dummy. That a robustness check gives the same result on the original data does not show that either version is valid. This section therefore checks the size of these variants with the same resampling design as above, under the pooled null hypothesis and with centred groups (pooled residual bootstrap at $s = 0$), in which groups differ only as much as groups of the same condition do in the data. It reuses the resampling functions `sim_pooled()`, `sim_shift()`, `sim2_pooled()` and `sim2_shift()`.
+
+- RH1: the regression of Table 3, column 1 and column 2 (second-half dummy and its interactions with the conditions), each clustered by subject and by group (CR1, $t$-distribution with $G - 1$ degrees of freedom, as in Stata), and a Welch $t$-test and the Wilcoxon test on the group-level difference-in-differences.
+- RH2: the probit Wald tests clustered by subject (as in the paper) and by group (CR1, normal reference distribution, as Stata's `dprobit`), and Welch $t$-tests on the group rates.
+
+```{r c3-cluster-helpers}
+# Weighted OLS on subject-half rates with CR1 cluster-robust SE; t(G - 1) reference as in Stata
+cl_ols <- function(y, w, X, cl, k = 2) {
+  XtW <- t(X * w); A <- solve(XtW %*% X); b <- A %*% (XtW %*% y)
+  e <- y - X %*% b
+  S <- rowsum(X * as.vector(w * e), cl)
+  G <- nrow(S); N <- sum(w); K <- ncol(X)
+  V <- (G / (G - 1)) * ((N - 1) / (N - K)) * A %*% crossprod(S) %*% A
+  2 * pt(-abs(b[k] / sqrt(V[k, k])), G - 1)
+}
+cl_X1 <- function(cond, h) cbind(1, cond == "Priority", cond == "Rebate", cond == "Discount")   # Table 3, col. 1
+cl_X2 <- function(cond, h) {                                                                    # Table 3, col. 2
+  P <- cond == "Priority"; R <- cond == "Rebate"; D <- cond == "Discount"; S <- h == 2
+  cbind(1, P, R, D, S, S * P, S * R, S * D)
+}
+cl_tests_h1 <- function(D) {
+  n <- length(D); m <- sapply(D, function(g) nrow(g$Y))
+  y  <- unlist(lapply(D, function(g) c(g$Y[, 1], g$Y[, 2])))
+  w  <- unlist(lapply(D, function(g) rep(g$W, each = nrow(g$Y))))
+  cd <- unlist(lapply(D, function(g) rep(c(g$c1, g$c2), each = nrow(g$Y))))
+  hh <- unlist(lapply(D, function(g) rep(1:2, each = nrow(g$Y))))
+  sj <- unlist(lapply(seq_len(n), function(i) rep(paste(i, seq_len(m[i])), 2)))
+  gg <- unlist(lapply(seq_len(n), function(i) rep(i, 2 * m[i])))
+  r1 <- sapply(D, function(g) mean(g$Y[, 1])); r2 <- sapply(D, function(g) mean(g$Y[, 2]))
+  c1 <- sapply(D, `[[`, "c1"); c2 <- sapply(D, `[[`, "c2")
+  cp <- c1 == "Control" & c2 == "Priority"; cc <- c1 == "Control" & c2 == "Control"
+  c(col1_subject = cl_ols(y, w, cl_X1(cd, hh), sj), col1_group = cl_ols(y, w, cl_X1(cd, hh), gg),
+    col2_subject = cl_ols(y, w, cl_X2(cd, hh), sj), col2_group = cl_ols(y, w, cl_X2(cd, hh), gg),
+    did_welch  = t.test((r2 - r1)[cp], (r2 - r1)[cc])$p.value,
+    did_wilcox = suppressWarnings(wilcox.test((r2 - r1)[cp], (r2 - r1)[cc])$p.value))
+}
+
+# Probit on subject rates (15 trials) with cluster-robust SE at the level given by cl
+cl_probit_wald <- function(y, cond, cl, n = 15, hc1 = FALSE) {
+  X <- cbind(1, cond == "Priority", cond == "Discount", cond == "Rebate")
+  f <- suppressWarnings(glm.fit(X, y, weights = rep(n, length(y)), family = binomial("probit")))
+  b <- f$coefficients; eta <- drop(X %*% b)
+  mu <- pmin(pmax(pnorm(eta), 1e-10), 1 - 1e-10); dd <- dnorm(eta)
+  A <- solve(crossprod(X * (n * dd^2 / (mu * (1 - mu))), X))
+  S <- rowsum(X * (n * (y - mu) * dd / (mu * (1 - mu))), cl)
+  G <- nrow(S); adj <- if (hc1) G / (G - 1) else 1
+  V <- adj * A %*% crossprod(S) %*% A
+  w <- function(L) 2 * pnorm(-abs(sum(L * b) / sqrt(drop(t(L) %*% V %*% L))))
+  c(PD = w(c(0, 1, -1, 0)), DR = w(c(0, 0, 1, -1)), RC = w(c(0, 0, 0, 1)))
+}
+cl_tests_h2 <- function(D) {
+  gc <- sapply(D, `[[`, "cond"); gr <- sapply(D, function(g) mean(g$y))
+  sc <- unlist(lapply(D, function(g) rep(g$cond, length(g$y)))); sy <- unlist(lapply(D, `[[`, "y"))
+  sj <- seq_along(sy); gg <- unlist(lapply(seq_along(D), function(i) rep(i, length(D[[i]]$y))))
+  ps <- cl_probit_wald(sy, sc, sj); pg <- cl_probit_wald(sy, sc, gg, hc1 = TRUE)
+  wt <- function(a, b) t.test(gr[gc == a], gr[gc == b])$p.value
+  c(subject_PD = ps[["PD"]], subject_DR = ps[["DR"]], subject_RC = ps[["RC"]],
+    group_PD = pg[["PD"]], group_DR = pg[["DR"]], group_RC = pg[["RC"]],
+    welch_PD = wt("Priority", "Discount"), welch_DR = wt("Discount", "Rebate"), welch_RC = wt("Rebate", "Control"))
+}
+
+# Checks on the original data
+sh2 <- sh %>% mutate(h = as.integer(h))
+c(col1_group = cl_ols(sh2$y, sh2$w, cl_X1(sh2$cond, sh2$h), sh2$gid),
+  col2_subject = cl_ols(sh2$y, sh2$w, cl_X2(sh2$cond, sh2$h), sh2$u_subject),
+  col2_group = cl_ols(sh2$y, sh2$w, cl_X2(sh2$cond, sh2$h), sh2$gid))
+cl_probit_wald(d1$y, d1$cond, d1$gid, hc1 = TRUE)   # group-clustered Wald p-values (cf. replication above)
+```
+
+```{r c3-cluster-size, cache=TRUE}
+B_cl <- 2000
+set.seed(2026)
+r1_pooled  <- t(replicate(B_cl, cl_tests_h1(sim_pooled())))
+r1_centred <- t(replicate(B_cl, cl_tests_h1(sim_shift(0, pooled = TRUE))))
+r2_pooled  <- t(replicate(B_cl, cl_tests_h2(sim2_pooled())))
+r2_centred <- t(replicate(B_cl, cl_tests_h2(sim2_shift(0, pooled = TRUE))))
+
+size_cl <- function(r) round(colMeans(r < 0.05, na.rm = TRUE), 3)
+rbind(pooled_null = size_cl(r1_pooled), centred_groups = size_cl(r1_centred)) %>% knitr::kable(caption = "RH1: simulated size")
+rbind(pooled_null = size_cl(r2_pooled), centred_groups = size_cl(r2_centred)) %>% knitr::kable(caption = "RH2: simulated size")
+```
+
+**Interpretation.**
+
+* *Time control.* With the second-half dummy and its interactions (column 2), the subject-clustered regression holds its level with centred groups (about 5%), but still rejects in about 29% of the replications under the pooled null hypothesis.
+* *Clustering by group.* Clustered by group, column 1 rejects in about 7% in both settings. Column 2, whose priority coefficient rests on the four priority groups of the first half, rejects in about 16% and 12%. For RH2, the group-clustered Wald tests reject in 13–17% under the pooled null hypothesis and in about 14% with centred groups. With so few treated groups, cluster-robust standard errors are too small (Cameron, Gelbach and Miller 2008; MacKinnon, Nielsen and Webb 2023), so clustering by group is no remedy.
+* *Tests on group values.* The exact Wilcoxon test on the group-level difference-in-differences keeps its level; the Welch $t$-test on the same group values is somewhat liberal with 3 and 8 groups.
+
+That clustering by subject and by group lead to the same conclusion on the original data therefore does not show that either is valid.
+
+## Interpretation
+
+The main conclusions of Kessler and Roth (2012) are robust. The priority rule increases donor registration, and the conditions are ordered as predicted. Both results hold at the group level, the level at which observations are independent by design. The comparison nevertheless yields four insights about test choice.
+
+- **The unit of analysis matters more than the choice between parametric and rank-based methods.** The conditions were assigned to groups of 12 subjects who share one pool of B units, so only the groups are independent by design. Aggregating to one value per group removes the dependence within groups from the data instead of assuming it away. The limit of this approach is that with only 3 to 8 groups per sequence of conditions, exact tests cannot reach small p-values.
+- **The authors' tests rest on assumptions that the design does not guarantee.** Clustering by subject is valid only if groups of the same condition hardly differ. In these data this appears to be the case, so the authors' p-values are plausible, but with larger group differences the same tests reject a true null hypothesis far too often. Clustering by group is no remedy, because with four treated groups the group-clustered tests also reject too often. For RH1, the pooled regression in addition mixes the treatment effect with the decline of registration over time.
+- **For the priority rule (RH1), the group-level designs confirm the effect as clearly as the design allows.** Both reach the smallest p-value that the number of groups permits. The difference-in-differences design removes the time trend through the always-Control groups, and the first-half comparison avoids it altogether.
+- **For the ordering of the conditions (RH2), the ordering as a whole and its individual steps must be distinguished.** The ordering as a whole is established at the group level, and the Jonckheere–Terpstra test detects it already with a small fraction of the observed effect. The individual steps cannot be resolved with 4 groups per treatment, and more than twice as many groups would be needed for Priority > Discount. The authors' significant steps therefore depend on treating subjects within a group as independent.
+
+Overall, the case shows that rank-based methods are most valuable here not because they outperform the authors' tests on the same observations, but because, applied to one value per independent unit, they provide valid inference without assumptions about the dependence within groups and make explicit how much independent information the experiment actually contains.
